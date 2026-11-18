@@ -1,0 +1,97 @@
+# 节点模板：放到 <节点文件夹>/<短id>.yaml，一个文件夹只放一个节点 yaml 和一个 docs/。删掉用不到的字段
+
+schema: codemap/v1
+
+# ---------- 基本 ----------
+id: order-svc                # 必填。全局唯一；子模块写 <上层id>.<短id>，比如 order-svc.create、order-svc.create.lock-stock
+kind: component               # 必填。project 项目 / component 组件 / sdk / resource 存储或中间件 / function 函数
+name: 订单服务                 # 必填。框上的标题：中文说清楚做什么（「锁库存」），专有名词才保留英文
+brief: order-svc OrderService      # 框上的副标题：函数名、组件名或关键参数（LockStock）
+desc: 下单、取消、查询订单   # 详情里的说明
+repo:                         # 组件对应哪个仓库，只作说明，子节点不继承；代码位置的仓库写在 fn.repo
+  remote: git@git.example.com:shop/order-svc.git   # 必填。git 远端地址，用来认出仓库
+  local: ../../order-svc         # 本机仓库目录，相对本 yaml 所在的文件夹
+resource: redis               # 仅 resource：和 id 一致，写探索脚本给的名字（redis / etcd / kafka / mysql / s3）
+kb:                           # 知识库：链接，或者相对本 yaml 所在文件夹的路径
+  - { title: 说明, url: docs/order-svc.md }
+  - { title: 设计文档, url: "https://wiki.example.com/p/1001" }
+review: { status: draft }     # 校对：draft / reviewed；核对过代码时再加 commit 和 shape（结构指纹）
+ignore: { code-missing: 第三方 SDK 不在我们的仓库里 }            # 关掉某条检查，写上原因
+issues:                       # 可选。待核查的问题点：看代码时发现的疑点，这次不修、后续要 check 的，一条一项
+  - desc: ":351 取消订单时没有释放优惠券，券会一直处于占用状态"   # 必填。问题是什么、影响是什么
+    code: handler/cancel_order.go:351   # 可选。问题所在的代码，格式同 fn.code；仓库取节点自己的 fn.repo
+
+# ---------- 函数：仅 kind: function ----------
+# 写了 trigger / serves 是入口，写了 check 是闸门，写了 outcome 是结束，其他是普通步骤；type 只决定显示效果，不影响角色
+fn:
+  repo: { remote: "git@git.example.com:shop/order-svc.git", local: ../../order-svc }   # 必填（写了 code 时）。代码在哪个仓库，local 相对本 yaml 所在的文件夹
+  code: internal/service/order.go:120-158   # 仓库根目录下的完整路径:行号；函数内部的代码块只写行号（如 28-32），不用写 repo
+  trigger: grpc                  # 怎么被调起来：grpc / http / tcp（Kafka 协议这类二进制协议）/ mq / cron / func
+  type: timer                    # 可选。函数类型，只写一种：listen 监听（订阅 / channel / watch，框内水波纹）/ timer 定时（按 every 闪一下）；普通函数不写
+  every: 5s                      # 仅 timer：多久一次，500ms / 3s / 1m
+  serves: CreateOrder            # 实现了哪条链路，输入输出从链路取
+  io: { in: [CreateOrderReq], out: Order }   # 输入输出；out 是右侧的结构体卡片
+  reads: [CreateOrderReq.UserId]   # 读了哪些字段
+  writes: [Order.UserID]           # 给哪些字段赋值
+  check: UserId 非空               # 校验什么
+  guards: [CreateOrderReq.UserId]  # 校验了哪些字段
+  outcome: success                 # 结束：success / error
+  terminal: false                  # 结束后不再交给任何人
+
+# ---------- 地图：写了 contains 就能打开 ----------
+contains:                     # 这张图上画的所有节点，三种写法：
+  - order-svc.create              # 1. 写 id：本节点子文件夹里的子节点
+  - { ref: redis, path: ../redis }  # 2. { ref, path }：引用别处的节点（调用方、中间件、其他组件）；是邻居，不算包含，可以互相引用
+                                    #    A 的图画了 A → B，B 有自己的地图时，B 的图里也要引用 A 并画出这条线（edge-mutual）
+                                    #    path 相对本 yaml 所在的文件夹，指向那个节点的文件夹；
+                                    #    path 为空或找不到：照样画，点不开，提示去配置
+  - id: validate              # 3. 写对象：就地定义一个叶子节点（短 id），不需要单独文件夹
+    kind: function
+    name: 参数校验
+    fn: { repo: { remote: "git@git.example.com:shop/order-svc.git", local: ../../order-svc }, code: internal/handler/validate.go:15-28, check: UserId 非空 }
+
+lanes:
+  # 泳道只决定节点的初始位置（没写 layout 时），图上不画框、不显示名字；不写 name。
+  # 不带 dock 的泳道从左到右排成业务列；dock: top / bottom 贴上下两边，dock: left / right 放在最左 / 最右一列。
+  # 每个节点都要放进某条泳道，存储和依赖服务也一样
+  - { id: caller, dock: left, nodes: [] }                       # 调用方 / 上游：固定放第一条、写 dock: left（没有就删掉这行）
+  - { id: deps, dock: top, nodes: [config-center, auth] }      # 依赖服务：配置、鉴权、元数据
+  - { id: handler, scope: handler/, nodes: [validate] }         # 业务列；scope 是代码目录，用来检查节点放错泳道
+  - { id: storage, dock: bottom, nodes: [redis] }               # 存储
+
+layout:                       # 可选。手动排过的位置，只对这张图有效；在 Codemap 里点「编辑布局」拖动后「保存」写这里，也可以手改
+  validate: [320, 180]        # 节点: [x, y]，key 和 edges 里的 from / to 写法一样（短 id 或全局 id）
+  redis: [360, 520]           # 没写 layout 的图按泳道自动布局；写了以后整张图按这里的位置画，后来新加的节点放在相连节点旁边
+
+edges:                        # 两端都必须在 contains 里（外部节点用 { ref, path } 写进去）
+  - from: validate            # 必填
+    to: redis                 # 必填
+    kind: call                # next 下一步（默认）/ call 调用 / send 投递 / return 返回
+    mode: go                  # 可选。起协程（go）或线程（thread），调用方不等结果；只用在 call / send 线上
+    via: order-svc.CreateOrder        # 这条线传什么数据：links.yaml 里的链路 id，多条写列表。
+                              # 写了 via 才有流动小球，点开能看到接口、结构体、字段；没写就是一条静态的线
+    when: pass                # 分支条件：pass / fail / 任意文字
+    error: false              # 错误分支
+    swallow: 降级处理          # 错误分支走到成功结束时，写明原因
+    name: 锁库存               # 线上的文字
+    id: validate-lock         # 同一对节点之间有多条线时才写
+    ports: [bottom, top]      # 可选。线从起点哪一边出、从终点哪一边进：top / bottom / left / right / auto；在 Codemap 里拖连线端点会自动写
+
+flows:                        # 每张图至少一个，按场景写（「新成员首次加入」），每步讲先做什么、后做什么
+  - id: create-ok             # 必填
+    name: 正常下单             # tab 上的名字
+    kind: main                # main 普通 / background 后台常驻（心跳）
+    period: 5s                # 仅 background
+    refines: order-system.place-order   # 接着上一层的哪个流程
+    scenario: { desc: 用户 9527 买 sku 1001 × 2, values: { Order.PayAmount: 11980 } }   # 场景，values 是卡片上的示例值
+    steps:
+      - { at: validate, title: 收到请求 }      # 小球停在某个节点
+      - from: validate                         # 沿哪条线走
+        to: inventory-svc
+        title: 调用库存服务
+        data: inventory-svc.LockStockReq       # 传哪份数据；线上只有一份时不写
+        signal: data                           # 小球种类：data / ack / error / heartbeat，一般自动推导
+        label: LockStockReq                    # 小球旁的标签
+        sample: "LockStockReq{ Items: [{1001, 2}], TTL: 900 }"   # 示例载荷
+        result: 锁定成功                        # 这一步的结果
+        async: false                           # 异步分叉

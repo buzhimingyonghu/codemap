@@ -1,0 +1,173 @@
+schema: codemap/v1
+
+requirement:
+  id: coupon
+  name: 下单支持优惠券
+  status: designing            # designing / developing / merged
+  desc: 下单时可使用一张优惠券；顺带修掉"按缓存价计算金额"，改用库存服务锁定时返回的实时价。
+  kb:
+    - { url: "https://tapd.example.com/1020358810", title: 需求单：下单支持优惠券 }
+  branches:                    # 这个需求对应的代码分支，key 是带 repo 的节点
+    order-svc: feature/coupon
+
+# 变更集：at 是被改的地图（容器节点），id 是被改的元素
+changes:
+  # ---------- 链路上的数据 ----------
+  - { add: field, at: order-svc.CreateOrderReq, value: { name: CouponId, type: int64 } }
+  - { add: field, at: order-svc.Order, value: { name: CouponID, type: int64 } }
+  - { add: field, at: order-svc.Order, value: { name: Discount, type: int64, desc: 优惠金额（分） } }
+  - add: link                  # 新增一条链路：校验优惠券 → 锁库存，传 Coupon
+    at: order-svc
+    value:
+      id: PassCoupon
+      protocol: func
+      name: lockStock(ctx, items, cp)
+      data:
+        - id: Coupon
+          repo: { remote: "git@git.example.com:shop/order-svc.git", local: ../../demo-repos/order-svc }
+          code: service/coupon.go
+          fields:
+            - { name: ID, type: int64 }
+            - { name: UserID, type: int64 }
+            - { name: Threshold, type: int64, desc: 使用门槛（分） }
+            - { name: Value, type: int64, desc: 面额（分） }
+            - { name: Used, type: bool }
+            - { name: ExpireAt, type: time.Time }
+
+  # ---------- 订单服务这张图 ----------
+  - add: node
+    at: order-svc
+    lane: service
+    value:
+      id: check-coupon
+      kind: function
+      name: 校验优惠券
+      brief: checkCoupon()
+      fn:
+        check: 券属于当前用户、未使用、未过期
+        guards: [CreateOrderReq.CouponId]
+        io: { in: [CreateOrderReq], out: Coupon }
+    proposed:
+      file: service/coupon.go
+      new: |
+        func (s *Service) checkCoupon(ctx context.Context, uid, couponID int64) (*Coupon, error) {
+            if couponID == 0 { return nil, nil }
+            c, err := s.couponRepo.Get(ctx, couponID)
+            if err != nil { return nil, err }
+            if c.UserID != uid || c.Used || c.ExpireAt.Before(time.Now()) {
+                return nil, ErrCouponInvalid
+            }
+            return c, nil
+        }
+  - { add: edge, at: order-svc, value: { from: validate, to: check-coupon, when: pass } }
+  - { add: edge, at: order-svc, value: { from: check-coupon, to: lock-stock, when: pass, via: PassCoupon } }
+  - { add: edge, at: order-svc, value: { from: check-coupon, to: fail-resp, when: fail, error: true } }
+  - { remove: edge, at: order-svc, id: validate->lock-stock }
+
+  - modify: flow
+    at: order-svc
+    id: create-ok
+    replace:
+      validate->lock-stock:
+        - { from: validate, to: check-coupon, title: 校验优惠券, label: CouponId=501, result: 优惠券有效：满 100 减 20 }
+        - { from: check-coupon, to: lock-stock, title: 锁库存, sample: "Coupon{ ID: 501, Threshold: 10000, Value: 2000 }" }
+  - modify: flow
+    at: order-svc
+    id: create-out-of-stock
+    replace:
+      validate->lock-stock:
+        - { from: validate, to: check-coupon }
+        - { from: check-coupon, to: lock-stock }
+
+  # ---------- buildOrder() 这张图 ----------
+  - modify: node
+    id: order-svc.build-order
+    set: { fn: { io: { in: [CreateOrderReq, StockResult, Coupon], out: Order } } }
+
+  - modify: node
+    id: order-svc.build-order.params
+    set: { brief: "req, stock, cp" }
+    proposed:
+      file: service/build.go:13
+      diff: |
+        - func (s *Service) buildOrder(ctx context.Context, req *pb.CreateOrderReq, stock *StockResult) (*Order, error) {
+        + func (s *Service) buildOrder(ctx context.Context, req *pb.CreateOrderReq, stock *StockResult, cp *Coupon) (*Order, error) {
+
+  - { remove: edge, at: order-svc.build-order, id: gate-items->price-cache }
+  - { remove: edge, at: order-svc.build-order, id: price-cache->calc-items }
+  - { remove: node, id: order-svc.build-order.price-cache }
+  - { add: edge, at: order-svc.build-order, value: { from: gate-items, to: calc-items, when: pass } }
+  - modify: node
+    id: order-svc.build-order.calc-items
+    set: { fn: { reads: [StockResult.Prices], writes: [Order.Items, Order.ItemsAmount] } }
+    proposed:
+      file: service/build.go:28-32
+      diff: |2
+          for i, it := range req.Items {
+        -     price := prices[i]          // 缓存价
+        +     price := stock.Prices[i]    // 库存服务锁定时返回的实时价
+
+  - add: node
+    at: order-svc.build-order
+    value:
+      id: apply-coupon
+      kind: function
+      name: 核销优惠券
+      brief: 门槛校验
+      fn:
+        check: 商品总额 ≥ 券门槛
+        reads: [Order.ItemsAmount, Coupon.Threshold, Coupon.Value]
+        writes: [Order.CouponID, Order.Discount]
+        guards: [Order.ItemsAmount]
+    proposed:
+      file: service/build.go:32     # 写在这一行之后
+      new: |
+        if cp != nil {
+            if o.ItemsAmount < cp.Threshold {
+                return nil, ErrCouponThreshold
+            }
+            o.Discount = min(cp.Value, o.ItemsAmount)
+            o.CouponID = cp.ID
+        }
+  - add: node
+    at: order-svc.build-order
+    value: { id: coupon-threshold, kind: function, name: return err, brief: ErrCouponThreshold, fn: { outcome: error } }
+    proposed: { file: service/build.go:32, new: "return nil, ErrCouponThreshold" }
+  - { remove: edge, at: order-svc.build-order, id: calc-items->calc-amount }
+  - { add: edge, at: order-svc.build-order, value: { from: calc-items, to: apply-coupon } }
+  - { add: edge, at: order-svc.build-order, value: { from: apply-coupon, to: calc-amount, when: pass } }
+  - { add: edge, at: order-svc.build-order, value: { from: apply-coupon, to: coupon-threshold, when: fail, error: true } }
+  - { add: edge, at: order-svc.build-order, value: { from: coupon-threshold, to: fail-resp, error: true } }
+
+  - modify: node
+    id: order-svc.build-order.calc-amount
+    set: { fn: { reads: [Order.ItemsAmount, Order.Discount], writes: [Order.PayAmount] } }
+    proposed:
+      file: service/build.go:34
+      diff: |
+        - o.PayAmount = o.ItemsAmount
+        + o.PayAmount = o.ItemsAmount - o.Discount
+        + if o.PayAmount < 0 { o.PayAmount = 0 }
+
+  - modify: flow
+    at: order-svc.build-order
+    id: build-replay
+    set:
+      scenario:
+        values:
+          Order.ID: 1839204711
+          Order.UserID: 9527
+          Order.Items: "[1001×2@5990]"
+          Order.ItemsAmount: 11980
+          Order.CouponID: 501
+          Order.Discount: 2000
+          Order.PayAmount: 9980
+          Order.Status: Pending
+          Order.CreatedAt: "10:21:07"
+    replace:
+      gate-items->price-cache: []
+      price-cache->calc-items:
+        - { from: gate-items, to: calc-items, title: 计算商品金额, label: stock.Prices, result: "o.ItemsAmount = 5990 × 2 = 11980（实时价）" }
+      calc-items->calc-amount:
+        - { from: calc-items, to: apply-coupon, title: 核销优惠券, sample: "cp = { Threshold: 10000, Value: 2000 }", result: "11980 ≥ 10000，Discount = 2000" }
+        - { from: apply-coupon, to: calc-amount, title: 计算应付, result: "o.PayAmount = 11980 − 2000 = 9980" }

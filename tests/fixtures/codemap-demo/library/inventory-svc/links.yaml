@@ -1,0 +1,67 @@
+owner: inventory-svc
+links:
+  - id: LockStock
+    protocol: grpc
+    name: inventory.InventoryService/LockStock
+    desc: 预扣库存，返回锁定 id 和实时价
+    data:
+      - id: LockStockReq
+        dir: request
+        repo: { remote: "git@git.example.com:shop/monorepo.git", local: ../../demo-repos/monorepo }
+        code: services/inventory/api/inventory.proto:12-15
+        fields:
+          - { name: Items, type: "[]Item" }
+          - { name: TTL, type: int32, desc: 锁定时长（秒） }
+      - id: LockStockResp
+        dir: response
+        repo: { remote: "git@git.example.com:shop/monorepo.git", local: ../../demo-repos/monorepo }
+        code: services/inventory/api/inventory.proto:17-22
+        fields:
+          - { name: Ok, type: bool }
+          - { name: LockId, type: string }
+          - { name: Prices, type: "[]int64", desc: 锁定时的实时价（分） }
+          - { name: Reason, type: string }
+
+  - id: AddStock
+    protocol: grpc
+    name: inventory.InventoryService/AddStock
+    desc: 入库加库存
+    data:
+      - id: AddStockReq
+        dir: request
+        repo: { remote: "git@git.example.com:shop/monorepo.git", local: ../../demo-repos/monorepo }
+        code: services/inventory/api/inventory.proto:24-28
+        fields:
+          - { name: SkuId, type: int64 }
+          - { name: Qty, type: int32 }
+          - { name: WarehouseId, type: int64, desc: 入库仓 }
+      - id: AddStockResp
+        dir: response
+        repo: { remote: "git@git.example.com:shop/monorepo.git", local: ../../demo-repos/monorepo }
+        code: services/inventory/api/inventory.proto:30-33
+        fields:
+          - { name: Ok, type: bool }
+          - { name: Stock, type: int64, desc: 入库后的库存 }
+
+  - id: ReleaseStock
+    protocol: grpc
+    name: inventory.InventoryService/ReleaseStock
+    desc: 释放一把库存锁
+    data:
+      - id: ReleaseStockReq
+        repo: { remote: "git@git.example.com:shop/monorepo.git", local: ../../demo-repos/monorepo }
+        code: services/inventory/api/inventory.proto:12-15
+        fields:
+          - { name: LockId, type: string }
+
+  - id: Beat
+    protocol: http
+    heartbeat: 5s
+    name: PUT /nacos/v1/ns/instance/beat
+    desc: 向注册中心上报心跳
+    data:
+      - id: BeatReq
+        missing: Nacos 客户端内置，本仓库没有定义
+        fields:
+          - { name: ServiceName, type: string }
+          - { name: Ip, type: string }

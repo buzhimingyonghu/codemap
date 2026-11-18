@@ -1,0 +1,21 @@
+owner: order-system.gateway
+links:
+  - id: PlaceOrder
+    protocol: http
+    name: POST /api/orders
+    desc: 用户端下单
+    data:
+      - id: PlaceOrderBody
+        dir: request
+        repo: { remote: "git@git.example.com:shop/gateway.git", local: ../../../demo-repos/gateway }
+        code: handler/order.go:10-13
+        fields:
+          - { name: items, type: "[]{sku, qty}" }
+          - { name: addrId, type: int64 }
+      - id: PlaceOrderResult
+        dir: response
+        repo: { remote: "git@git.example.com:shop/gateway.git", local: ../../../demo-repos/gateway }
+        code: handler/order.go:15-18
+        fields:
+          - { name: orderId, type: string }
+          - { name: payAmount, type: float, desc: 元 }

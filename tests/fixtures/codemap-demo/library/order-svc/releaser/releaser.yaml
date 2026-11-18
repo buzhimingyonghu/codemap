@@ -1,0 +1,78 @@
+schema: codemap/v1
+id: order-svc.releaser
+kind: function
+name: 释放超时库存
+brief: releaseLoop（协程）
+desc: 常驻循环：订单支付了就不再管它的库存锁；每 30 秒扫一遍过期的锁，没支付的释放库存。
+fn: { repo: { remote: "git@git.example.com:shop/order-svc.git", local: ../../../demo-repos/order-svc }, code: service/release.go:13-33 }
+
+# ---------- 函数内部：一个 for { select } 循环 ----------
+contains:
+  - { ref: order-svc.create-order, path: .. }
+  - { ref: inventory-svc, path: ../../inventory-svc }
+  - id: start
+    kind: function
+    name: 起定时器，订阅已支付
+    brief: NewTicker(30s) · Subscribe
+    fn: { code: 14-16, trigger: func }
+  - id: wait
+    kind: function
+    name: 等待
+    brief: "for { select }"
+    fn: { code: 17-18 }
+  - id: on-paid
+    kind: function
+    name: 订单已支付
+    brief: "case id := <-paid"
+    fn: { code: 21-22, type: listen }
+  - id: on-tick
+    kind: function
+    name: 30 秒到点
+    brief: "case <-ticker.C"
+    fn: { code: 23-24, type: timer, every: 30s }
+  - id: check
+    kind: function
+    name: 这把锁付款了吗
+    brief: lock.Paid
+    fn: { code: 25-29, check: 锁对应的订单是否已支付 }
+  - id: release
+    kind: function
+    name: 释放库存
+    brief: invCli.ReleaseStock
+    fn: { code: "28" }
+  - id: stop
+    kind: function
+    name: ctx 取消，退出
+    brief: "case <-ctx.Done()"
+    fn: { code: 19-20, outcome: success, terminal: true }
+
+lanes:
+  - { id: caller, dock: left, nodes: [order-svc.create-order] }
+  - { id: main, nodes: [start, wait, on-paid, on-tick, check, release] }
+  - { id: end, dock: right, nodes: [stop] }
+  - { id: deps, dock: bottom, nodes: [inventory-svc] }
+
+edges:
+  - { from: order-svc.create-order, to: start, kind: call, mode: go, name: go releaseLoop(ctx) }
+  - { from: start, to: wait }
+  - { from: wait, to: on-paid, when: 收到已支付 }
+  - { from: wait, to: on-tick, when: 30 秒到点 }
+  - { from: wait, to: stop, when: ctx 取消 }
+  - { from: on-paid, to: wait }
+  - { from: on-tick, to: check }
+  - { from: check, to: wait, when: 已付款 }
+  - { from: check, to: release, when: 未付款 }
+  - { from: release, to: inventory-svc, kind: call, via: inventory-svc.ReleaseStock }
+  - { from: release, to: wait }
+
+flows:
+  - id: sweep
+    name: 到点扫一遍，释放没付款的
+    steps:
+      - { from: order-svc.create-order, to: start, title: 服务启动时起协程，不等它 }
+      - { from: start, to: wait, title: 起 30 秒定时器，进入循环 }
+      - { from: wait, to: on-tick, title: 30 秒到点 }
+      - { from: on-tick, to: check, title: 取出过期的锁 }
+      - { from: check, to: release, title: 订单没付款 }
+      - { from: release, to: inventory-svc, title: 释放库存 }
+      - { from: release, to: wait, title: 回到等待 }

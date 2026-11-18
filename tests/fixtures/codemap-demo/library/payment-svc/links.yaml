@@ -1,0 +1,33 @@
+owner: payment-svc
+links:
+  - id: pay-events
+    protocol: mq
+    name: pay-events
+    desc: 支付结果
+    data:
+      - id: PaySucceeded
+        repo: { remote: "git@git.example.com:shop/payment-svc.git", local: ../../demo-repos/payment-svc }
+        code: mq/events.go:5-8
+        fields:
+          - { name: OrderID, type: int64 }
+          - { name: PaidAt, type: time.Time }
+
+  - id: PayNotify
+    protocol: http
+    name: POST /pay/notify
+    desc: 第三方支付的异步回调
+    data:
+      - id: PayNotifyReq
+        dir: request
+        repo: { remote: "git@git.example.com:shop/payment-svc.git", local: ../../demo-repos/payment-svc }
+        code: handler/notify.go:8-12
+        fields:
+          - { name: out_trade_no, type: string, desc: 订单号 }
+          - { name: total_fee, type: int64, desc: 分 }
+          - { name: sign, type: string }
+      - id: PayNotifyResp
+        dir: response
+        repo: { remote: "git@git.example.com:shop/payment-svc.git", local: ../../demo-repos/payment-svc }
+        code: handler/notify.go:14-16
+        fields:
+          - { name: return_code, type: string, desc: SUCCESS / FAIL }

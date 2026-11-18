@@ -1,0 +1,33 @@
+syntax = "proto3";
+
+package inventory;
+
+service InventoryService {
+  rpc LockStock(LockStockReq) returns (LockStockResp);
+  rpc AddStock(AddStockReq) returns (AddStockResp);
+}
+
+message Item { int64 sku_id = 1; int32 qty = 2; }
+
+message LockStockReq {
+  repeated Item items = 1;
+  int32 ttl = 2; // 锁定时长（秒）
+}
+
+message LockStockResp {
+  bool ok = 1;
+  string lock_id = 2;
+  repeated int64 prices = 3; // 锁定时的实时价（分）
+  string reason = 4;
+}
+
+message AddStockReq {
+  int64 sku_id = 1;
+  int32 qty = 2;
+  int64 warehouse_id = 3; // 入库仓
+}
+
+message AddStockResp {
+  bool ok = 1;
+  int64 stock = 2; // 入库后的库存
+}

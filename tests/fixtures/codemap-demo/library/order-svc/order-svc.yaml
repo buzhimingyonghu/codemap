@@ -1,0 +1,164 @@
+schema: codemap/v1
+id: order-svc
+kind: component
+name: 订单服务
+desc: 创建订单、消费支付结果
+repo: { remote: "git@git.example.com:shop/order-svc.git", local: ../../demo-repos/order-svc }
+kb:
+  - { url: "https://wiki.example.com/p/2002", title: 下单流程设计 }
+  - { url: "docs/状态机.md", title: 订单状态机 }
+
+review: { status: reviewed }
+
+# ---------- 作为地图 ----------
+contains:
+  - id: create-order
+    kind: function
+    name: CreateOrder
+    brief: gRPC 入口
+    review: { status: reviewed, commit: 3f2a91c, shape: 9b04e1 }
+    fn: { repo: { remote: "git@git.example.com:shop/order-svc.git", local: ../../demo-repos/order-svc }, code: handler/order.go:19-32, trigger: grpc, serves: CreateOrder }
+
+  - id: validate
+    kind: function
+    name: 参数校验
+    brief: validate()
+    fn:
+      repo: { remote: "git@git.example.com:shop/order-svc.git", local: ../../demo-repos/order-svc }
+      code: handler/validate.go:15-28
+      check: UserId 非空；Items 为 1~50 条；每条 Qty > 0
+      guards: [CreateOrderReq.UserId, CreateOrderReq.Items]
+    issues:
+      - desc: "没校验 SkuId：传 0 也能过，到锁库存才报错"
+        code: "22-26"
+
+  - id: lock-stock
+    kind: function
+    name: 锁库存
+    brief: lockStock()
+    review: { status: reviewed, commit: 3f2a91c, shape: 51c7aa }
+    kb:
+      - { url: "https://wiki.example.com/p/2003", title: 库存预扣与超时释放 }
+    fn: { repo: { remote: "git@git.example.com:shop/order-svc.git", local: ../../demo-repos/order-svc }, code: service/order.go:35-44, io: { in: [CreateOrderReq], out: StockResult } }
+
+  - build-order                # 引用：定义在 build-order/build-order.yaml
+  - releaser                   # 后台协程：释放超时库存（循环）
+
+  - { id: save, kind: function, name: 落库, brief: repo.Save(), fn: { repo: { remote: "git@git.example.com:shop/order-svc.git", local: ../../demo-repos/order-svc }, code: repo/order.go:15-17 } }
+  - { id: publish, kind: function, name: 发事件, brief: PublishCreated(), fn: { repo: { remote: "git@git.example.com:shop/order-svc.git", local: ../../demo-repos/order-svc }, code: mq/producer.go:9-11 } }
+
+  - id: resp
+    kind: function
+    name: 组装响应
+    brief: CreateOrderResp
+    fn: { repo: { remote: "git@git.example.com:shop/order-svc.git", local: ../../demo-repos/order-svc }, code: handler/order.go:27-31, outcome: success }
+
+  - id: fail-resp
+    kind: function
+    name: 返回错误
+    brief: gRPC status
+    fn: { repo: { remote: "git@git.example.com:shop/order-svc.git", local: ../../demo-repos/order-svc }, code: handler/order.go:21-25, outcome: error }
+
+  # 第二个入口：消费支付成功事件
+  - id: on-pay-succeeded
+    kind: function
+    name: 支付成功消费者
+    brief: OnPaySucceeded()
+    fn: { repo: { remote: "git@git.example.com:shop/order-svc.git", local: ../../demo-repos/order-svc }, code: handler/pay_event.go:10-21, trigger: mq, serves: payment-svc.pay-events }
+
+  - id: mark-paid
+    kind: function
+    name: 标记已支付
+    brief: 条件更新，保证幂等
+    fn: { repo: { remote: "git@git.example.com:shop/order-svc.git", local: ../../demo-repos/order-svc }, code: service/order.go:47-50 }
+
+  - { id: publish-paid, kind: function, name: 发已支付事件, brief: PublishPaid(), fn: { repo: { remote: "git@git.example.com:shop/order-svc.git", local: ../../demo-repos/order-svc }, code: mq/producer.go:13-15 } }
+
+  - id: paid-ack
+    kind: function
+    name: 确认消费
+    brief: ack
+    fn: { repo: { remote: "git@git.example.com:shop/order-svc.git", local: ../../demo-repos/order-svc }, code: handler/pay_event.go:20, outcome: success }
+
+  # 外部节点：画在这张图上，点进去看它自己
+  - { ref: order-system.gateway, path: ../order-system }
+  - { ref: inventory-svc, path: ../inventory-svc }
+  - { ref: order-system.mysql, path: ../order-system }
+  - { ref: order-system.mq, path: ../order-system }
+
+lanes:
+  - { id: handler, name: handler/,    scope: handler/,       nodes: [create-order, validate, resp, fail-resp, on-pay-succeeded, paid-ack] }
+  - { id: service, name: service/,    scope: service/,       nodes: [lock-stock, build-order, mark-paid, releaser] }
+  - { id: repo,    name: repo/ · mq/, scope: [repo/, mq/],   nodes: [save, publish, publish-paid] }
+  - { id: ext,     name: 外部,                                nodes: [order-system.gateway, inventory-svc, order-system.mysql, order-system.mq] }
+
+edges:
+  # 和外部节点的连线（外部节点在 contains 里用 { ref, path } 引用）
+  - { from: order-system.gateway, to: create-order, kind: call, via: CreateOrder }
+  - { from: lock-stock, to: inventory-svc, kind: call, via: inventory-svc.LockStock }
+  - { from: save, to: order-system.mysql, kind: call, name: INSERT orders }
+  - { from: publish, to: order-system.mq, kind: send, via: order-events }
+  - { from: resp, to: order-system.gateway, kind: return, via: CreateOrder }
+  - { from: fail-resp, to: order-system.gateway, kind: return, error: true }
+  - { from: order-system.mq, to: on-pay-succeeded, kind: send, via: payment-svc.pay-events }
+  - { from: mark-paid, to: order-system.mysql, kind: call, name: UPDATE orders }
+  - { from: publish-paid, to: order-system.mq, kind: send, via: order-events }
+  - { from: paid-ack, to: order-system.mq, kind: return }
+
+  # 图内连线（kind 默认 next）
+  - { from: create-order, to: validate, via: ValidateReq }
+  - { from: validate, to: lock-stock, when: pass }
+  - { from: validate, to: fail-resp, when: fail, error: true }
+  - { from: lock-stock, to: build-order, via: BuildOrder }
+  - { from: lock-stock, to: fail-resp, when: 库存不足, error: true }
+  - { from: build-order, to: save, via: SaveOrder }
+  - { from: build-order, to: fail-resp, error: true }
+  - { from: save, to: publish }
+  - { from: publish, to: resp }
+  - { from: on-pay-succeeded, to: mark-paid, via: MarkPaid }
+  - { from: mark-paid, to: publish-paid }
+  - { from: publish-paid, to: paid-ack }
+  - { from: create-order, to: releaser, kind: call, mode: go, name: 起释放库存的协程 }
+  - { from: releaser, to: inventory-svc, kind: call, via: inventory-svc.ReleaseStock, name: 释放没付款订单的库存 }
+
+flows:
+  - id: create-ok
+    name: 正常下单
+    refines: order-system.place-order
+    steps:
+      - { from: order-system.gateway, to: create-order, title: gRPC 入口, sample: "CreateOrderReq{ UserId: 9527, Items: [{1001, 2}], AddrId: 88 }" }
+      - { from: create-order, to: validate, title: 参数校验, result: UserId / Items / Qty 校验通过 }
+      - { from: validate, to: lock-stock, title: 锁库存, label: req.Items }
+      - { from: lock-stock, to: inventory-svc, title: 调用库存服务, sample: "LockStockReq{ Items: [{1001, 2}], TTL: 900 }" }
+      - { from: inventory-svc, to: lock-stock, title: 锁定成功, sample: 'LockStockResp{ Ok: true, LockId: "lk_77", Prices: [5990] }' }
+      - { from: lock-stock, to: build-order, title: 构建订单, sample: 'StockResult{ LockID: "lk_77", Prices: [5990] }' }
+      - { from: build-order, to: save, title: 落库, sample: "Order{ ID: 1839204711, UserID: 9527, PayAmount: 11980, Status: 0 }" }
+      - { from: save, to: order-system.mysql, title: INSERT, label: INSERT orders }
+      - { from: order-system.mysql, to: save, title: 写入成功, label: OK, sample: "Rows affected: 1" }
+      - { from: save, to: publish, title: 发事件 }
+      - { from: publish, to: order-system.mq, title: 投递 MQ, data: OrderCreated, sample: "OrderCreated{ OrderID: 1839204711, UserID: 9527, Amount: 11980 }" }
+      - { from: publish, to: resp, title: 组装响应 }
+      - { from: resp, to: order-system.gateway, title: 返回网关, sample: "CreateOrderResp{ OrderId: 1839204711, PayAmount: 11980 }" }
+
+  - id: create-out-of-stock
+    name: 库存不足
+    refines: order-system.out-of-stock
+    steps:
+      - { from: order-system.gateway, to: create-order }
+      - { from: create-order, to: validate }
+      - { from: validate, to: lock-stock }
+      - { from: lock-stock, to: inventory-svc }
+      - { from: inventory-svc, to: lock-stock, signal: error, title: 锁定失败, sample: 'LockStockResp{ Ok: false, Reason: "OUT_OF_STOCK" }' }
+      - { from: lock-stock, to: fail-resp, title: 返回业务错误, label: ErrOutOfStock }
+      - { from: fail-resp, to: order-system.gateway, title: 返回网关, label: FailedPrecondition }
+
+  - id: pay-ok
+    name: 支付成功
+    refines: order-system.pay-callback
+    steps:
+      - { from: order-system.mq, to: on-pay-succeeded, title: 收到支付成功事件, sample: "PaySucceeded{ OrderID: 1839204711 }" }
+      - { from: on-pay-succeeded, to: mark-paid, title: 标记已支付 }
+      - { from: mark-paid, to: order-system.mysql, title: 条件更新, sample: "UPDATE orders SET status = 1 WHERE id = 1839204711 AND status = 0", result: 影响 1 行；重复消费时影响 0 行，直接确认 }
+      - { from: mark-paid, to: publish-paid, title: 发已支付事件 }
+      - { from: publish-paid, to: order-system.mq, title: 投递 MQ, data: OrderPaid, sample: "OrderPaid{ OrderID: 1839204711 }" }
+      - { from: publish-paid, to: paid-ack, title: 确认消费 }

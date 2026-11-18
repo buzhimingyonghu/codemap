@@ -1,0 +1,6 @@
+schema: codemap/v1
+id: payment-svc
+kind: component
+name: 支付服务
+desc: 对接第三方支付，验签、落支付流水。
+repo: { remote: "git@git.example.com:shop/payment-svc.git", local: ../../demo-repos/payment-svc }

@@ -1,0 +1,83 @@
+owner: order-svc
+links:
+  - id: CreateOrder
+    protocol: grpc
+    name: order.OrderService/CreateOrder
+    desc: 创建订单
+    data:
+      - id: CreateOrderReq
+        dir: request
+        repo: { remote: "git@git.example.com:shop/order-svc.git", local: ../../demo-repos/order-svc }
+        code: api/order.proto:14-18
+        fields:
+          - { name: UserId, type: int64 }
+          - { name: Items, type: "[]Item" }
+          - { name: AddrId, type: int64 }
+      - id: CreateOrderResp
+        dir: response
+        repo: { remote: "git@git.example.com:shop/order-svc.git", local: ../../demo-repos/order-svc }
+        code: api/order.proto:20-24
+        fields:
+          - { name: OrderId, type: int64 }
+          - { name: PayAmount, type: int64 }
+          - { name: ExpireAt, type: int64 }
+
+  - id: order-events
+    protocol: mq
+    name: order-events
+    desc: 订单领域事件，订单创建、订单已支付都发到这个 topic
+    data:
+      - id: OrderCreated
+        repo: { remote: "git@git.example.com:shop/order-svc.git", local: ../../demo-repos/order-svc }
+        code: mq/events.go:6-10
+        fields:
+          - { name: OrderID, type: int64 }
+          - { name: UserID, type: int64 }
+          - { name: Amount, type: int64 }
+      - id: OrderPaid
+        repo: { remote: "git@git.example.com:shop/order-svc.git", local: ../../demo-repos/order-svc }
+        code: mq/events.go:13-15
+        fields:
+          - { name: OrderID, type: int64 }
+
+  - id: ValidateReq
+    protocol: func
+    name: validate(req)
+    data:
+      - { ref: CreateOrderReq }
+
+  - id: BuildOrder
+    protocol: func
+    name: buildOrder(ctx, req, stock)
+    data:
+      - id: StockResult
+        repo: { remote: "git@git.example.com:shop/order-svc.git", local: ../../demo-repos/order-svc }
+        code: service/order.go:15-18
+        fields:
+          - { name: LockID, type: string }
+          - { name: Prices, type: "[]int64", desc: 库存服务锁定时返回的实时价 }
+
+  - id: SaveOrder
+    protocol: func
+    name: repo.Save(ctx, o)
+    data:
+      - id: Order
+        desc: 订单聚合，由 buildOrder() 组装
+        repo: { remote: "git@git.example.com:shop/order-svc.git", local: ../../demo-repos/order-svc }
+        code: service/model.go:12-20
+        kb:
+          - { url: "https://wiki.example.com/p/2004", title: 订单表结构 }
+        fields:
+          - { name: ID, type: int64, desc: snowflake 单号 }
+          - { name: UserID, type: int64 }
+          - { name: Items, type: "[]*OrderItem" }
+          - { name: ItemsAmount, type: int64, desc: 商品总额（分） }
+          - { name: PayAmount, type: int64, desc: 应付金额（分） }
+          - { name: Status, type: int8 }
+          - { name: CreatedAt, type: time.Time }
+
+  - id: MarkPaid
+    protocol: func
+    name: MarkPaid(ctx, evt)
+    data:
+      - { ref: payment-svc.PaySucceeded }

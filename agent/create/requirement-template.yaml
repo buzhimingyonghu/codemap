@@ -1,0 +1,53 @@
+# 需求模板：在底图上画的增 / 改 / 删。放到节点库的 requirements/<id>.yaml（按 requirement 字段识别，不是节点）
+
+requirement:
+  id: coupon                  # 必填
+  name: 下单支持优惠券          # 必填
+  status: designing           # designing 设计中 / developing 开发中 / merged 已合入
+  desc: 下单时可使用一张优惠券
+  kb: [{ title: 需求单, url: "https://tapd.example.com/1020358810" }]
+  branches: { order-svc: feature/coupon }   # 对应的代码分支：仓库节点 id → 分支
+
+changes:
+  # 新增节点：at 是加到哪张地图，lane 是放进哪条泳道
+  - add: node
+    at: order-svc
+    lane: service
+    layout: [480, 260]        # 可选。新节点在 at 这张图上的位置；合入时写回地图的 layout
+    value: { id: check-coupon, kind: function, name: 校验优惠券, fn: { check: 券属于当前用户、未使用、未过期 } }
+    proposed:                 # 拟写的代码
+      file: service/coupon.go # 打算写在哪：文件:行号
+      new: |                  # 新代码
+        func (s *Service) checkCoupon(...) (*Coupon, error) { ... }
+
+  # 修改节点：set 合并进节点（fn 只改写到的字段）
+  - modify: node
+    id: order-svc.build-order.calc-amount   # 全局 id
+    set: { fn: { reads: [Order.ItemsAmount, Order.Discount] } }
+    proposed:
+      file: service/build.go:34
+      diff: |                 # 改动："- " 删除，"+ " 新增
+        - o.PayAmount = o.ItemsAmount
+        + o.PayAmount = o.ItemsAmount - o.Discount
+
+  # 删除节点：引用它的 contains 一起去掉
+  - { remove: node, id: order-svc.build-order.price-cache }
+
+  # 连线、流程、泳道：at 是哪张地图
+  - { add: edge, at: order-svc, value: { from: validate, to: check-coupon, when: pass } }
+  - { remove: edge, at: order-svc, id: validate->lock-stock }
+  - modify: flow
+    at: order-svc
+    id: create-ok
+    replace:                  # 按 from->to 替换流程里的一步，可以换成多步，也可以换成 []
+      validate->lock-stock:
+        - { from: validate, to: check-coupon, title: 校验优惠券 }
+        - { from: check-coupon, to: lock-stock, title: 锁库存 }
+
+  # 链路和数据
+  - add: link                 # 新增链路：at 是 owner
+    at: order-svc
+    value: { id: PassCoupon, protocol: func, data: [{ id: Coupon, code: service/coupon.go, fields: [{ name: ID, type: int64 }] }] }
+  - { add: field, at: order-svc.Order, value: { name: Discount, type: int64 } }   # 给数据加字段
+
+  # 其他：add: member / lane / flow / data / kb，remove: member / lane / flow / field，modify: edge

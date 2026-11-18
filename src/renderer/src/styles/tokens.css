@@ -1,0 +1,164 @@
+/* Design tokens. Every surface, border, and motion value in the chrome reads from here,
+   so restyling the IDE means editing one block per theme. */
+:root {
+  --font-ui: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', sans-serif;
+  --font-mono: 'SF Mono', ui-monospace, Menlo, Monaco, 'Cascadia Code', monospace;
+  --font-size-ui: 13px;
+  --font-size-small: 12px;
+  --font-size-tiny: 11px;
+
+  --radius-sm: 4px;
+  --radius-md: 6px;
+  --radius-lg: 8px;
+
+  --titlebar-height: 40px;
+  --activity-width: 48px;
+  --tabbar-height: 36px;
+  --statusbar-height: 24px;
+  --row-height: 24px;
+
+  --ease-out: cubic-bezier(0.22, 1, 0.36, 1);
+  --ease-in-out: cubic-bezier(0.65, 0, 0.35, 1);
+  --ease-spring: cubic-bezier(0.34, 1.4, 0.64, 1);
+  --duration-fast: 120ms;
+  --duration-base: 180ms;
+  --duration-slow: 280ms;
+}
+
+:root,
+[data-theme='graphite'] {
+  --bg-window: #111317;
+  --bg-chrome: rgba(20, 22, 27, 0.86);
+  --bg-sidebar: rgba(22, 24, 29, 0.82);
+  --bg-editor: #16181d;
+  --bg-panel: #14161a;
+  --bg-elevated: #20232a;
+  --bg-input: #1b1e24;
+  --bg-hover: rgba(255, 255, 255, 0.05);
+  --bg-active: rgba(255, 255, 255, 0.085);
+  --bg-selected: rgba(45, 212, 191, 0.14);
+
+  --fg-primary: #e6e9ef;
+  --fg-secondary: #a3abb9;
+  --fg-muted: #6b7385;
+  --fg-on-accent: #04201c;
+
+  --border-subtle: rgba(255, 255, 255, 0.06);
+  --border-strong: rgba(255, 255, 255, 0.12);
+
+  --accent: #2dd4bf;
+  --accent-soft: rgba(45, 212, 191, 0.16);
+  --accent-2: #f59e8b;
+  --accent-2-soft: rgba(245, 158, 139, 0.16);
+
+  --success: #4ade80;
+  --warning: #fbbf24;
+  --danger: #f87171;
+  --info: #7dd3fc;
+
+  --git-modified: #f3c97a;
+  --git-added: #4ade80;
+  --git-deleted: #f87171;
+  --git-untracked: #7dd3fc;
+  --git-conflicted: #f472b6;
+
+  --breakpoint: #f87171;
+  --debug-line: rgba(251, 191, 36, 0.16);
+
+  --shadow-pop: 0 18px 48px rgba(0, 0, 0, 0.45), 0 0 0 1px rgba(255, 255, 255, 0.07);
+  --scrim: rgba(5, 6, 8, 0.45);
+}
+
+[data-theme='midnight'] {
+  --bg-window: #08090b;
+  --bg-chrome: rgba(12, 13, 16, 0.9);
+  --bg-sidebar: rgba(13, 14, 17, 0.86);
+  --bg-editor: #0c0d10;
+  --bg-panel: #0b0c0e;
+  --bg-elevated: #17191d;
+  --bg-input: #121418;
+  --bg-hover: rgba(255, 255, 255, 0.045);
+  --bg-active: rgba(255, 255, 255, 0.08);
+  --bg-selected: rgba(163, 230, 53, 0.13);
+
+  --fg-primary: #eceef2;
+  --fg-secondary: #9ca3af;
+  --fg-muted: #5f6672;
+  --fg-on-accent: #142004;
+
+  --border-subtle: rgba(255, 255, 255, 0.055);
+  --border-strong: rgba(255, 255, 255, 0.11);
+
+  --accent: #a3e635;
+  --accent-soft: rgba(163, 230, 53, 0.15);
+  --accent-2: #fb7185;
+  --accent-2-soft: rgba(251, 113, 133, 0.15);
+
+  --success: #a3e635;
+  --warning: #fbbf24;
+  --danger: #fb7185;
+  --info: #67e8f9;
+
+  --git-modified: #fbbf24;
+  --git-added: #a3e635;
+  --git-deleted: #fb7185;
+  --git-untracked: #67e8f9;
+  --git-conflicted: #f0abfc;
+
+  --breakpoint: #fb7185;
+  --debug-line: rgba(251, 191, 36, 0.14);
+
+  --shadow-pop: 0 18px 48px rgba(0, 0, 0, 0.6), 0 0 0 1px rgba(255, 255, 255, 0.07);
+  --scrim: rgba(0, 0, 0, 0.55);
+}
+
+[data-theme='paper'] {
+  --bg-window: #f3f4f3;
+  --bg-chrome: rgba(246, 247, 246, 0.86);
+  --bg-sidebar: rgba(240, 242, 241, 0.8);
+  --bg-editor: #ffffff;
+  --bg-panel: #fafbfa;
+  --bg-elevated: #ffffff;
+  --bg-input: #ffffff;
+  --bg-hover: rgba(15, 23, 20, 0.045);
+  --bg-active: rgba(15, 23, 20, 0.08);
+  --bg-selected: rgba(15, 118, 110, 0.11);
+
+  --fg-primary: #1f2428;
+  --fg-secondary: #56606a;
+  --fg-muted: #8a939e;
+  --fg-on-accent: #ffffff;
+
+  --border-subtle: rgba(15, 23, 20, 0.08);
+  --border-strong: rgba(15, 23, 20, 0.15);
+
+  --accent: #0f766e;
+  --accent-soft: rgba(15, 118, 110, 0.12);
+  --accent-2: #c2410c;
+  --accent-2-soft: rgba(194, 65, 12, 0.11);
+
+  --success: #15803d;
+  --warning: #b45309;
+  --danger: #dc2626;
+  --info: #0369a1;
+
+  --git-modified: #b45309;
+  --git-added: #15803d;
+  --git-deleted: #dc2626;
+  --git-untracked: #0369a1;
+  --git-conflicted: #be185d;
+
+  --breakpoint: #dc2626;
+  --debug-line: rgba(245, 158, 11, 0.16);
+
+  --shadow-pop: 0 18px 48px rgba(15, 23, 20, 0.16), 0 0 0 1px rgba(15, 23, 20, 0.08);
+  --scrim: rgba(15, 23, 20, 0.18);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --duration-fast: 0ms;
+    --duration-base: 0ms;
+    --duration-slow: 0ms;
+  }
+}

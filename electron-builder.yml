@@ -1,0 +1,66 @@
+appId: dev.codemap.ide
+productName: Codemap
+copyright: Copyright © 2026 Victor Liu
+directories:
+  output: release
+  buildResources: build
+files:
+  - out/**/*
+  - package.json
+  - '!**/*.map'
+# Bundled plugins live outside the asar so they can be read and copied like user plugins.
+extraResources:
+  - from: plugins
+    to: plugins
+    filter:
+      - '**/*'
+  # The assistant's workflow, templates, and knowledge.
+  - from: agent
+    to: agent
+    filter:
+      - '**/*'
+asar: true
+# node-pty loads a native module and executes its spawn-helper, so both must sit on disk.
+asarUnpack:
+  - node_modules/node-pty/**
+npmRebuild: false
+# Only ship the UI languages macOS will actually pick for this app.
+electronLanguages:
+  - en
+  - zh_CN
+  - zh_TW
+mac:
+  target:
+    - target: dmg
+      arch: [arm64]
+    - target: zip
+      arch: [arm64]
+  category: public.app-category.developer-tools
+  icon: build/icon.icns
+  # Ad-hoc signature: runs on this Mac and on Apple Silicon (which refuses unsigned code).
+  # Replace with a Developer ID identity and enable notarize to distribute to other Macs.
+  identity: '-'
+  hardenedRuntime: true
+  entitlements: build/entitlements.mac.plist
+  entitlementsInherit: build/entitlements.mac.plist
+  gatekeeperAssess: false
+  notarize: false
+  minimumSystemVersion: '12.0'
+  artifactName: Codemap-${version}-arm64-mac.${ext}
+  extendInfo:
+    NSRequiresAquaSystemAppearance: false
+    LSApplicationCategoryType: public.app-category.developer-tools
+dmg:
+  title: Codemap
+  artifactName: Codemap-${version}-arm64.dmg
+  contents:
+    - x: 160
+      y: 200
+    - x: 400
+      y: 200
+      type: link
+      path: /Applications
+  window:
+    width: 560
+    height: 380
+publish: null

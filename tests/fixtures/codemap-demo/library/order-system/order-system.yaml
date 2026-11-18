@@ -1,0 +1,116 @@
+schema: codemap/v1
+id: order-system
+kind: component
+name: 订单系统
+desc: 下单、支付回调、库存预扣、消息通知
+kb:
+  - { url: "https://wiki.example.com/p/2001", title: 订单系统知识库 }
+
+review: { status: reviewed }
+
+# ---------- 作为地图：包含哪些节点 ----------
+contains:
+  - { id: user, kind: component, name: 用户端, brief: App / H5, desc: 发起下单、查看订单。 }
+  - id: gateway
+    kind: component
+    name: API 网关
+    brief: 鉴权 · 限流
+    desc: HTTP 转 gRPC，统一鉴权与限流。
+    repo: { remote: "git@git.example.com:shop/gateway.git", local: ../../demo-repos/gateway }
+  - { id: thirdpay, kind: component, name: 第三方支付, brief: 微信 / 支付宝, desc: 外部系统，异步回调支付结果。 }
+  - order-svc                  # 引用：定义在 order-svc/order-svc.yaml
+  - inventory-svc              # 引用：同时也被 warehouse-system 包含
+  - payment-svc
+  - id: notify
+    kind: component
+    name: 通知服务
+    desc: 消费订单事件，推送短信 / App 消息。
+    repo: git@git.example.com:shop/notify-svc.git
+  - { id: registry, kind: resource, resource: nacos, name: 注册中心, brief: Nacos, desc: 服务注册发现，各服务每 5s 上报心跳。 }
+  - { id: mysql, kind: resource, resource: mysql, name: MySQL, brief: orders 库, desc: 订单主表 orders、明细 order_items。 }
+  - { id: redis, kind: resource, resource: redis, name: Redis, brief: 库存计数, desc: "stock:{sku} 计数，Lua 原子扣减。" }
+  - { id: mq, kind: resource, resource: mq, name: MQ, brief: order-events / pay-events, desc: 订单与支付领域事件。 }
+
+lanes:
+  - { id: access,  name: 接入层,        nodes: [user, gateway, thirdpay] }
+  - { id: biz,     name: 业务服务,      nodes: [order-svc, inventory-svc, payment-svc, notify] }
+  - { id: infra,   name: 基础设施,      nodes: [registry] }
+  - { id: storage, name: 存储 / 中间件, dock: bottom, nodes: [mysql, redis, mq] }
+
+edges:
+  - { from: user, to: gateway, kind: call, via: gateway.PlaceOrder }
+  - { from: gateway, to: order-svc, kind: call, via: order-svc.CreateOrder }
+  - { from: order-svc, to: inventory-svc, kind: call, via: inventory-svc.LockStock }
+  - { id: release-stock, from: order-svc, to: inventory-svc, kind: call, via: inventory-svc.ReleaseStock, name: 释放超时库存 }
+  - { from: inventory-svc, to: redis, kind: call, name: Lua 扣减 }
+  - { from: order-svc, to: mysql, kind: call, name: 读写订单 }
+  - { from: order-svc, to: mq, kind: send, via: order-svc.order-events }
+  - { from: mq, to: notify, kind: send, via: order-svc.order-events }
+  - { from: mq, to: order-svc, kind: send, via: payment-svc.pay-events }
+  - { from: thirdpay, to: payment-svc, kind: call, via: payment-svc.PayNotify }
+  - { from: payment-svc, to: mq, kind: send, via: payment-svc.pay-events }
+  - { from: order-svc, to: registry, kind: send, name: 心跳, ignore: { edge-mutual: 心跳由注册中心 SDK 自动上报，不画进订单服务内部 } }
+  - { from: inventory-svc, to: registry, kind: send, via: inventory-svc.Beat, name: 心跳 }
+  - { from: payment-svc, to: registry, kind: send, name: 心跳 }
+  - { from: notify, to: registry, kind: send, name: 心跳 }
+
+flows:
+  - id: place-order
+    name: 下单
+    scenario: { desc: 用户 9527 购买 sku 1001 × 2，单价 59.90，库存 120 }
+    steps:
+      - { at: user, title: 用户提交订单, sample: "购物车结算：sku 1001 × 2" }
+      - from: user
+        to: gateway
+        title: HTTP 下单请求
+        sample: |
+          POST /api/orders
+          Authorization: Bearer eyJ...
+          { "items": [{"sku":1001,"qty":2}], "addrId": 88 }
+        result: 鉴权通过，限流放行
+      - { from: gateway, to: order-svc, title: 转发到订单服务, sample: "CreateOrderReq{ UserId: 9527, Items: [{SkuId:1001, Qty:2}], AddrId: 88 }" }
+      - { from: order-svc, to: inventory-svc, title: 锁库存, sample: "LockStockReq{ Items: [{1001, 2}], TTL: 900 }" }
+      - { from: inventory-svc, to: redis, title: Lua 原子扣减, label: EVAL lock.lua, sample: "EVAL lock_stock.lua 1 stock:1001 2", result: "库存 120 → 118" }
+      - { from: redis, to: inventory-svc, title: 扣减成功, label: "118", sample: "(integer) 118" }
+      - { from: inventory-svc, to: order-svc, title: 锁定成功，返回实时价, sample: 'LockStockResp{ Ok: true, LockId: "lk_77", Prices: [5990] }' }
+      - { from: order-svc, to: mysql, title: 订单落库, label: INSERT orders, sample: "INSERT INTO orders (id, user_id, pay_amount, status) VALUES (1839204711, 9527, 11980, 0)" }
+      - { from: mysql, to: order-svc, title: 写入成功, label: OK, sample: "Rows affected: 1" }
+      - { from: order-svc, to: mq, title: 发布订单创建事件, data: order-svc.OrderCreated, sample: "OrderCreated{ OrderID: 1839204711, UserID: 9527, Amount: 11980 }" }
+      - { from: mq, to: notify, async: true, title: 通知服务消费, data: order-svc.OrderCreated, result: "推送「下单成功，请在 15 分钟内支付」" }
+      - { from: order-svc, to: gateway, title: 返回下单结果, sample: "CreateOrderResp{ OrderId: 1839204711, PayAmount: 11980, ExpireAt: 1791125167 }" }
+      - { from: gateway, to: user, title: HTTP 200, label: 200 OK, sample: '{ "orderId": "1839204711", "payAmount": 119.80 }' }
+
+  - id: pay-callback
+    name: 支付回调
+    steps:
+      - { at: thirdpay, title: 用户完成支付 }
+      - { from: thirdpay, to: payment-svc, title: 支付结果回调, sample: 'POST /pay/notify { out_trade_no: 1839204711, total_fee: 11980, sign: "9F3A..." }', result: 验签 + 金额比对 }
+      - { from: payment-svc, to: thirdpay, title: 应答第三方, sample: "PayNotifyResp{ return_code: SUCCESS }" }
+      - { from: payment-svc, to: mq, title: 发布支付成功事件, sample: 'PaySucceeded{ OrderID: 1839204711, PaidAt: "10:23:41" }' }
+      - { from: mq, to: order-svc, title: 订单服务消费 }
+      - { from: order-svc, to: mysql, title: 更新订单状态, label: UPDATE status, result: 条件更新保证幂等 }
+      - { from: order-svc, to: mq, title: 发布已支付事件, data: order-svc.OrderPaid }
+      - { from: mq, to: notify, title: 推送支付成功, data: order-svc.OrderPaid }
+
+  - id: out-of-stock
+    name: 库存不足
+    steps:
+      - { at: user, title: 用户提交订单, sample: "sku 1001 × 2" }
+      - { from: user, to: gateway, title: HTTP 下单请求, label: POST /orders }
+      - { from: gateway, to: order-svc, title: 转发 }
+      - { from: order-svc, to: inventory-svc, title: 锁库存 }
+      - { from: inventory-svc, to: redis, title: Lua 扣减, label: EVAL lock.lua }
+      - { from: redis, to: inventory-svc, signal: error, title: 库存不足, label: "-1", sample: "stock:1001 = 1 < 2，返回 -1" }
+      - { from: inventory-svc, to: order-svc, signal: error, title: 锁定失败, sample: 'LockStockResp{ Ok: false, Reason: "OUT_OF_STOCK" }' }
+      - { from: order-svc, to: gateway, signal: error, title: 业务错误, label: FailedPrecondition }
+      - { from: gateway, to: user, signal: error, title: HTTP 409, sample: '{ "code": 40901, "msg": "库存不足" }' }
+
+  - id: heartbeat
+    name: 心跳
+    kind: background
+    period: 5s
+    steps:
+      - { from: order-svc, to: registry, sample: "Beat{ service: order-svc, ip: 192.0.2.12, weight: 1 }" }
+      - { from: inventory-svc, to: registry }
+      - { from: payment-svc, to: registry }
+      - { from: notify, to: registry }

@@ -1,0 +1,106 @@
+schema: codemap/v1
+id: order-svc.build-order     # id 前缀 order-svc：仓库、短 id 都从 order-svc 继承
+kind: function
+name: 构建订单
+brief: buildOrder()
+review: { status: reviewed, commit: 3f2a91c, shape: e2d930 }
+fn:
+  repo: { remote: "git@git.example.com:shop/order-svc.git", local: ../../../demo-repos/order-svc }
+  code: service/build.go:13-41
+  io: { in: [CreateOrderReq, StockResult], out: Order }   # out 就是右侧的结构体卡片
+
+# ---------- 作为地图：函数层 ----------
+contains:
+  # 函数内部的代码块：file 省略时用外层 build-order 的文件
+  - { id: params, kind: function, name: 入参, brief: "req, stock", fn: { code: 13-14, trigger: func } }
+
+  - id: get-user
+    kind: function
+    name: 查用户
+    brief: userRepo.Get
+    fn: { code: 16-20, reads: [CreateOrderReq.UserId], writes: [Order.UserID] }
+
+  - id: gate-items
+    kind: function
+    name: 价格条数校验
+    brief: len 对齐
+    fn: { code: 22-24, check: 库存服务返回的价格条数 = 商品条数, guards: [StockResult.Prices] }
+
+  - { id: price-mismatch, kind: function, name: return err, brief: ErrPriceMismatch, fn: { code: 23, outcome: error } }
+  - { id: price-cache, kind: function, name: 查价格缓存, brief: priceCache.MGet, fn: { code: 26 } }
+
+  - id: calc-items
+    kind: function
+    name: 计算商品金额
+    brief: Items / ItemsAmount
+    fn: { code: 28-32, writes: [Order.Items, Order.ItemsAmount] }
+
+  - id: calc-amount
+    kind: function
+    name: 计算应付
+    brief: PayAmount
+    fn: { code: 34, reads: [Order.ItemsAmount], writes: [Order.PayAmount] }
+
+  - { id: gen-id, kind: function, name: 生成单号, brief: snowflake, fn: { code: 36, writes: [Order.ID] } }
+  - { id: set-meta, kind: function, name: 状态 / 时间, brief: Status / CreatedAt, fn: { code: 37-38, writes: [Order.Status, Order.CreatedAt] } }
+  - { id: ret, kind: function, name: return o, brief: "*Order", fn: { code: 40, outcome: success } }
+
+  # 外部节点：order-svc 图里和 build-order 相连的节点
+  - { ref: order-svc.lock-stock, path: .. }
+  - { ref: order-svc.save, path: .. }
+  - { ref: order-svc.fail-resp, path: .. }
+
+edges:
+  # 和外部节点：分别对应 order-svc 图里 build-order 的入边和两条出边
+  - { from: lock-stock, to: params, via: BuildOrder }
+  - { from: ret, to: save, via: SaveOrder }
+  - { from: price-mismatch, to: fail-resp, error: true }
+
+  - { from: params, to: get-user }
+  - { from: get-user, to: gate-items }
+  - { from: gate-items, to: price-cache, when: pass }
+  - { from: gate-items, to: price-mismatch, when: fail, error: true }
+  - { from: price-cache, to: calc-items }
+  - { from: calc-items, to: calc-amount }
+  - { from: calc-amount, to: gen-id }
+  - { from: gen-id, to: set-meta }
+  - { from: set-meta, to: ret }
+
+flows:
+  - id: build-replay
+    name: 执行回放
+    refines: order-svc.create-ok
+    scenario:
+      values:                  # 结构体卡片上显示的字段值（示例）
+        Order.ID: 1839204711
+        Order.UserID: 9527
+        Order.Items: "[1001×2@5990]"
+        Order.ItemsAmount: 11980
+        Order.PayAmount: 11980
+        Order.Status: Pending
+        Order.CreatedAt: "10:21:07"
+    steps:
+      - from: lock-stock
+        to: params
+        title: 进入函数
+        sample: |
+          req   = CreateOrderReq{ UserId: 9527, Items: [{1001, 2}] }
+          stock = StockResult{ Prices: [5990] }
+      - { from: params, to: get-user, title: 查用户, label: req.UserId, result: "o.UserID = 9527" }
+      - { from: get-user, to: gate-items, title: 价格条数校验, sample: "len(Prices)=1, len(Items)=1", result: 闸门通过 }
+      - { from: gate-items, to: price-cache, title: 查价格缓存, result: "prices = [5990]" }
+      - { from: price-cache, to: calc-items, title: 计算商品金额, result: "o.ItemsAmount = 5990 × 2 = 11980" }
+      - { from: calc-items, to: calc-amount, title: 计算应付, result: "o.PayAmount = 11980" }
+      - { from: calc-amount, to: gen-id, title: 生成单号, result: "o.ID = 1839204711" }
+      - { from: gen-id, to: set-meta, title: 状态 / 时间, result: "Status = Pending, CreatedAt = 10:21:07" }
+      - { from: set-meta, to: ret, title: 返回 }
+      - { from: ret, to: save, title: 交给落库 }
+
+  - id: build-price-mismatch
+    name: 价格校验失败
+    steps:
+      - { from: lock-stock, to: params, sample: "req.Items = [{1001,2},{1002,1}]；stock.Prices = [5990]" }
+      - { from: params, to: get-user }
+      - { from: get-user, to: gate-items, sample: "len(Prices)=1 ≠ len(Items)=2" }
+      - { from: gate-items, to: price-mismatch, title: 闸门拦截, label: ErrPriceMismatch }
+      - { from: price-mismatch, to: fail-resp, title: 上层返回错误 }

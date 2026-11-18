@@ -1,0 +1,21 @@
+# Dependencies
+node_modules/
+
+# Build output
+out/
+dist/
+release/
+*.tsbuildinfo
+
+# Generated icon intermediates (build/icon.png and build/icon.icns are committed)
+build/icon.iconset/
+
+# Test artifacts
+tests/e2e/artifacts/
+tests/e2e/fixture-*/
+
+# OS / editor
+.DS_Store
+*.log
+.vscode/
+.idea/

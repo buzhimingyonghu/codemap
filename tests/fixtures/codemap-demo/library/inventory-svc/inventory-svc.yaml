@@ -1,0 +1,8 @@
+schema: codemap/v1
+id: inventory-svc
+kind: component
+name: 库存服务
+desc: 库存预扣 / 释放。还没往下钻，所以没有 contains。
+repo: { remote: "git@git.example.com:shop/monorepo.git", local: ../../demo-repos/monorepo }
+kb:
+  - { url: "https://wiki.example.com/p/2003", title: 库存预扣与超时释放 }

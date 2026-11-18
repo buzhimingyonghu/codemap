@@ -1,0 +1,72 @@
+# 链路模板：连线上传什么数据。放到 owner 节点的文件夹里，文件名 links.yaml；连线写 via: 链路id 引用。
+# 每个接口一条链路，请求 / 响应各一份 data，字段全部列出（名字、类型、说明），从代码里取，点开连线就能看到。
+# 每份 data 必须写 repo + code（结构体定义在哪），找不到定义就写 missing: 原因。
+
+schema: codemap/v1
+
+owner: order-svc              # 必填。属于哪个节点：链路的全局 id 是 owner.id，代码仓库也从它来
+
+links:
+  # ---------- http：一个接口一条 ----------
+  - id: Heartbeat             # 必填。全局 id 是 owner.id；别的节点引用写 order-svc.Heartbeat
+    protocol: http            # http / grpc / tcp（Kafka 协议这类二进制协议）/ mq / func / sql / redis
+    heartbeat: true           # 可选。周期性的接口（心跳、定时上报）才写：true 表示周期由客户端配置，写在 desc 里；固定周期写 3s
+    name: POST /v1/client/heartbeat   # 显示名：http 写 方法 + 路径，grpc 写 服务/方法
+    desc: 客户端心跳：上报持有的分片，返回分配的分片
+    kb: [{ title: 接口文档, url: "https://wiki.example.com/p/xxxx" }]
+    data:                     # 必填。这条线上传的数据，一份一条
+      - id: HeartbeatRequest  # 结构体名；全局 id 是 owner.id
+        dir: request          # request 去（默认）/ response 回
+        repo: { remote: "git@git.example.com:shop/order-svc.git", local: ../../order-svc }   # 必填：结构体在哪个仓库；local 相对本文件所在的文件夹
+        code: internal/model/heartbeat.go:18-25   # 必填：仓库根目录下的路径:行号
+        # 实在找不到定义（字节流、别人负责的服务），不写 repo / code，改写：
+        # missing: 云 API 不归我们负责，本机没有它的代码
+        fields:               # 字段全部列出；嵌套结构体写类型名，再单独定义一份 data
+          - { name: ClientId, type: string, desc: 客户端 id }
+          - { name: Shards, type: "[]ShardInfo", desc: 当前持有的分片 }
+      - id: ShardInfo         # 嵌套的结构体也单独写一份，字段里用类型名引用
+        repo: { remote: "git@git.example.com:shop/order-svc.git", local: ../../order-svc }
+        code: internal/model/shard.go:74-78
+        fields:
+          - { name: ShardId, type: string }
+          - { name: Replicas, type: "[]int32" }
+      - id: HeartbeatResponse
+        dir: response
+        repo: { remote: "git@git.example.com:shop/order-svc.git", local: ../../order-svc }
+        code: internal/model/heartbeat.go:131-141
+        fields:
+          - { name: Data.Shards, type: "[]ShardInfo", desc: 分配给这个客户端的分片 }   # 外层包了一层时写 Data.字段
+          - { name: ErrCode, type: int }
+      # 字节流、header：name 写 body / "header 名字"
+      # - { name: body, type: "[]byte", desc: OrderBatch }
+      # - { name: "header err_code", type: string }
+
+  # ---------- mq / etcd：一个 topic 一条，没有 response ----------
+  - id: order-events
+    protocol: mq
+    name: "etcd shop/order-events"   # topic 名或 etcd key
+    data:
+      - id: OrderEventMsg
+        repo: { remote: "git@git.example.com:shop/order-svc.git", local: ../../order-svc }
+        code: internal/event/publish.go:40-53
+        fields:
+          - { name: "[]", type: "[]string", desc: "整个消息是一个数组时，name 写 []" }
+
+  # ---------- redis：一类 key 一条 ----------
+  - id: StockKey
+    protocol: redis
+    name: "HASH stock:{shop}:{sku}"   # 数据结构 + key 模式
+    data:
+      - id: StockHash
+        repo: { remote: "git@git.example.com:shop/order-svc.git", local: ../../order-svc }
+        code: internal/stock/stock.go:23-69
+        fields:
+          - { name: "{warehouse}_{sku}", type: int64, desc: "hash field → value" }
+
+  # ---------- 多个接口传同一份数据：ref 引用，不重复写字段 ----------
+  - id: UpdateOrder
+    protocol: http
+    name: POST /v1/orders/update
+    data:
+      - { ref: UpdateOrderRequest }
+      - { ref: StatusOkResponse, dir: response }

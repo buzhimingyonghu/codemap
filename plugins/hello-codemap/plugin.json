@@ -1,0 +1,14 @@
+{
+  "id": "hello-codemap",
+  "name": "Hello Codemap",
+  "version": "0.1.0",
+  "description": "Example plugin: a sidebar view with workspace stats and a command that inserts a timestamp. Copy this folder to start your own.",
+  "renderer": "index.js",
+  "contributes": {
+    "commands": [
+      { "id": "hello-codemap.insertTimestamp", "title": "Insert Timestamp" },
+      { "id": "hello-codemap.countLines", "title": "Count Lines in Current File" }
+    ],
+    "views": [{ "id": "hello-codemap.stats", "title": "Workspace Stats", "location": "sidebar", "icon": "code" }]
+  }
+}

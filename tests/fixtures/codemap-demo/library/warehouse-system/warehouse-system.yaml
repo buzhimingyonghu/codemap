@@ -1,0 +1,16 @@
+schema: codemap/v1
+id: warehouse-system
+kind: component
+name: 仓储系统
+desc: 入库、出库、盘点；和订单系统共用库存服务
+review: { status: draft }
+
+contains:
+  - id: wms
+    kind: component
+    name: 仓储服务
+    repo: git@git.example.com:shop/wms-svc.git
+  - inventory-svc              # 和 order-system 共用同一个节点
+
+edges:
+  - { from: wms, to: inventory-svc, kind: call, name: 入库加库存, via: inventory-svc.AddStock }

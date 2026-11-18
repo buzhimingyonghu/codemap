@@ -1,0 +1,6 @@
+# 节点库忽略规则
+.*
+node_modules/
+docs/
+local/
+todo/
