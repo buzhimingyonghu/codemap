@@ -390,10 +390,31 @@ export class CodeMapEngine {
     for (const el of this.nodes.values()) el.classList.toggle('trace', ids.includes(el.dataset.id ?? ''))
   }
 
-  /** Nodes the AI assistant is looking at or pointing to; they pulse until cleared. */
-  agentMark(ids: string[]): void {
-    const set = new Set(ids)
-    for (const el of this.nodes.values()) el.classList.toggle('agent', set.has(el.dataset.id ?? ''))
+  /**
+   * Nodes the AI assistant is looking at (lit: amber, glowing) and the ones it looked at
+   * before in this answer (trail: faint amber). The note shows in a bubble above the first lit node.
+   */
+  agentMark(marks: { lit: string[]; trail: string[]; note: string | null }): void {
+    const lit = new Set(marks.lit)
+    const trail = new Set(marks.trail)
+    for (const el of this.nodes.values()) {
+      const id = el.dataset.id ?? ''
+      el.classList.toggle('agent', lit.has(id))
+      el.classList.toggle('agent-trail', !lit.has(id) && trail.has(id))
+      el.querySelector('.cm-agent-note')?.remove()
+    }
+    const first = marks.note ? marks.lit.map((id) => this.nodes.get(id)).find(Boolean) : undefined
+    const shape = first?.querySelector<SVGGraphicsElement>('.cm-shape')
+    if (!first || !shape || !marks.note) return
+    const box = shape.getBBox()
+    const text = fitText(marks.note, 320, 11)
+    const w = Math.min(340, Math.max(60, text.length * 12 + 20))
+    const x = box.x + box.width / 2
+    const y = box.y - 12
+    const g = document.createElementNS('http://www.w3.org/2000/svg', 'g')
+    g.setAttribute('class', 'cm-agent-note')
+    g.innerHTML = `<rect x="${x - w / 2}" y="${y - 22}" width="${w}" height="22" rx="11"/><path d="M${x - 5},${y} L${x},${y + 6} L${x + 5},${y} Z"/><text x="${x}" y="${y - 7}">${esc(text)}</text>`
+    first.appendChild(g)
   }
 
   setFocus(id: string | null): void {

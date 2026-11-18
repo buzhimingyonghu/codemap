@@ -13,7 +13,8 @@ const BASE = [
   'Keep answers short and plain; name nodes by their name and id.',
   'Ground every statement in what you read: node files, code, or the knowledge folder. If something is a guess, say so.',
   'Use show_on_map as you go: open the map you are looking at and highlight the nodes you mean, so the user can follow on the map.',
-  'Never edit files directly. Changes go through propose_change_set; the user previews them on the map and applies them.'
+  'Never edit files directly. Changes go through propose_change_set; the user previews them on the map and applies them.',
+  'Checker errors are yours to fix, before you hand anything to the user. Never ask the user to look at, judge, or fix checker problems, and do not list them in your messages. What you ask the user about is the architecture and the logic: how the business is split, what each node does, whether the flows tell the story right.'
 ].join('\n')
 
 const MODE: Record<AgentMode, string> = {
@@ -26,6 +27,7 @@ const MODE: Record<AgentMode, string> = {
   adjust: [
     'Mode: Adjust. Change the map the user has open (and its parent and child maps when needed) as the user asks: split a node, merge nodes, add a missed branch, rename, fix edges or flows.',
     'Read the affected maps and the code first. Keep parent and child maps consistent: an edge into a node on the parent map needs a matching entry on its own map, and flows that refine a parent flow must still line up.',
+    'Keep node docs in step: when a node you change has a doc (<node folder>/docs/<id>.md, linked in kb), read it and update the parts the change affects in the same change set; also update the parent node doc when its map changes. A new map gets a new doc following create/node-doc-template.md.',
     'Propose the whole change in one change set, then read the checker problems in the reply and fix them with a corrected proposal.'
   ].join('\n'),
   create: [

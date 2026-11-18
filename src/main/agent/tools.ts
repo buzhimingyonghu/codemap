@@ -18,7 +18,8 @@ export interface ToolEnv {
   mode: AgentMode
   /** Lets the map follow the agent (focus a node, open a map, select a flow). */
   focus(map: string | null, nodes: string[], flow?: string | null, note?: string): void
-  propose(set: Omit<AgentChangeSet, 'id' | 'sessionId' | 'problems' | 'status'>): AgentChangeSet
+  /** New proposal, or with extend: add files and changes to a proposal not yet applied (checked as a whole). */
+  propose(set: Omit<AgentChangeSet, 'id' | 'sessionId' | 'problems' | 'status'>, extend?: string): AgentChangeSet
   /** Create mode: stop at a review gate. */
   gate(stage: string, summary: string): void
   /** Create mode: run sub-agents for several nodes at once (resolves when all finished). */
@@ -459,7 +460,8 @@ const TOOLS: ToolDef[] = [
         'changes: a list in the requirement change format: { add: node, at: <map id>, lane?, value: {...node} } | { modify: node, id: <global id>, set: {...} } | { remove: node, id } | { add|remove: edge, at, value|id } | { add|modify|remove: flow, at, value|id|set|replace } | { add: member|lane|link|data|field|kb, at, value } ...',
         'files: whole files to create or replace (library-relative path → full text), for new maps that live in their own folder (<folder>/<id>.yaml), links.yaml, or docs.',
         'In require mode also give requirement { id, name, desc }: the set is saved as requirements/<id>.yaml instead of being applied to the base map.',
-        'Check the result: the reply lists checker problems this proposal introduces; fix them with another proposal before finishing.'
+        'extend: id of an earlier proposal that is not applied yet. The files and changes are added to it (a file with the same path replaces the earlier text) and the whole proposal is checked again. Use it to build one proposal over several calls: changes that only make sense together (a node moved into its own folder plus the parent map that now refers to it) must end up in the same proposal, otherwise each half fails the check.',
+        'Check the result: the reply lists checker problems of the proposal as a whole; fix them with extend on the same proposal, not with a new one.'
       ].join('\n'),
       schema: {
         type: 'object',
@@ -468,6 +470,7 @@ const TOOLS: ToolDef[] = [
           summary: { type: 'string', description: 'What changes and why, in plain words' },
           changes: { type: 'array', items: { type: 'object' } },
           files: { type: 'object', additionalProperties: { type: 'string' } },
+          extend: { type: 'string', description: 'Id of an earlier proposal (not applied yet) to add these files and changes to' },
           requirement: { type: 'object', properties: { id: { type: 'string' }, name: { type: 'string' }, desc: { type: 'string' } } }
         },
         required: ['title', 'summary']
@@ -488,11 +491,12 @@ const TOOLS: ToolDef[] = [
         changes: Array.isArray(i.changes) ? i.changes : [],
         files,
         requirement: env.mode === 'require' && i.requirement ? { id: str(i.requirement.id) || 'requirement', name: str(i.requirement.name) || str(i.title), desc: str(i.requirement.desc) || undefined } : undefined
-      })
+      }, i.extend ? str(i.extend) : undefined)
       const errors = set.problems.filter((p) => p.level === 'error')
+      const head = `Proposal ${set.id} (${Object.keys(set.files).length} files, ${set.changes.length} changes) recorded as a draft; the user sees it only when you finish.`
       const text = set.problems.length
-        ? `Proposal ${set.id} recorded. Checker problems it introduces:\n${set.problems.map((p) => `${p.level} [${p.rule}] ${p.where}: ${p.msg}`).join('\n')}`
-        : `Proposal ${set.id} recorded. The checker found no new problems.`
+        ? `${head}\nChecker problems so far:\n${set.problems.map((p) => `${p.level} [${p.rule}] ${p.where}: ${p.msg}`).join('\n')}\nIf you are still writing this map, keep going and add the rest with extend: \"${set.id}\". Once everything is written, fix all of these together in one extend call (each error says how), not one by one.`
+        : `${head} The checker found no problems.`
       return { ok: true, content: clip(text), summary: errors.length ? `${errors.length} errors` : 'no new problems' }
     }
   },
@@ -524,6 +528,8 @@ const TOOLS: ToolDef[] = [
     run: async (env, i) => {
       if (!env.delegate) return { ok: false, content: 'Sub-agents are not available here.', summary: 'not available' }
       const tasks = (Array.isArray(i.tasks) ? i.tasks : []).map((t: any) => ({ node: str(t.node), instructions: str(t.instructions) })).filter((t) => t.node)
+      if (!tasks.length)
+        return { ok: false, content: 'No tasks given. Call delegate_nodes with tasks: [{ node: <global id>, instructions: <the task package from section E> }, ...].', summary: 'no tasks' }
       const report = await env.delegate(tasks)
       return ok(report, `${tasks.length} sub-agents finished`)
     }

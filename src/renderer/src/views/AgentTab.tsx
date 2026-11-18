@@ -1,6 +1,6 @@
-import { BookOpen, Check, ChevronDown, CircleAlert, CircleCheck, Eye, EyeOff, FolderGit2, FolderOutput, History, Link2, LoaderCircle, MessageSquarePlus, Plus, Send, Sparkles, Square, Trash2, X } from 'lucide-react'
+import { BookOpen, Check, ChevronDown, CircleAlert, CircleCheck, CircleSlash, Eye, EyeOff, FolderGit2, FolderOutput, History, Link2, LoaderCircle, MessageSquarePlus, Plus, Send, Sparkles, Square, Trash2, X } from 'lucide-react'
 import { useEffect, useRef, useState, type ReactNode } from 'react'
-import { AGENT_MODES, type AgentChangeSet, type AgentMode, type AgentStepView } from '@shared/agent'
+import { AGENT_MODES, type AgentChangeSet, type AgentEndReason, type AgentMode, type AgentStepView } from '@shared/agent'
 import { t } from '../lib/i18n'
 import {
   addLink,
@@ -9,21 +9,22 @@ import {
   outputFolder,
   removeDoc,
   removeRepo,
-  applyChangeSet,
   approveGate,
   deleteSession,
   newSession,
   openSession,
   previewChangeSet,
   previewing,
-  refreshSessions,
   rejectChangeSet,
+  restoreSession,
   send,
   setMode,
   setModel,
   setOutput,
+  applyChangeSet,
   stop,
-  useAgent
+  useAgent,
+  type WorkerView
 } from '../services/agent'
 import { useCodeMap } from '../services/codeMap'
 import { setState } from '../state/store'
@@ -49,12 +50,7 @@ const PLACEHOLDER = (): Record<AgentMode, string> => ({
 const GUIDE = (): Record<AgentMode, string[]> => ({
   ask: [t('Name the scenario or node: "When a user stops a task…"'), t('Say what you want: the flow, where the data goes, why it fails')],
   adjust: [t('Select the node on the map first'), t('Say the change: split / merge / add a branch / rename, and why')],
-  create: [
-    t('Pick the repositories (several are fine) and add documents or links above'),
-    t('Say the business in one sentence: what it does, for whom'),
-    t('Name where it starts (console, API, scheduled job) and where data ends up'),
-    t('Mention what to focus on and what to leave out')
-  ],
+  create: [t('Pick repositories above, then say in one sentence what the business does')],
   require: [t('Select the nodes the requirement touches, or name them'), t('Describe the requirement: what changes for the user'), t('Say any constraint: compatibility, rollout, performance')]
 })
 
@@ -185,11 +181,12 @@ export function AgentTab({ selected, onFocusNode }: { selected: string | null; o
   const agent = useAgent()
   const [draft, setDraft] = useState('')
   const [history, setHistory] = useState(false)
+  const [allModes, setAllModes] = useState(false)
   const scrollRef = useRef<HTMLDivElement>(null)
   const configured = agent.settings?.providers.find((p) => p.id === agent.settings?.activeProvider)?.hasKey !== false
 
   useEffect(() => {
-    void refreshSessions()
+    void restoreSession()
   }, [])
   useEffect(() => {
     const el = scrollRef.current
@@ -197,8 +194,9 @@ export function AgentTab({ selected, onFocusNode }: { selected: string | null; o
   }, [agent.messages, agent.changeSets.length, agent.gate, agent.workers])
 
   const needRepo = agent.mode === 'create' && !agent.repos.length && !agent.sessionId
+  const sessionsShown = allModes ? agent.sessions : agent.sessions.filter((s) => s.mode === agent.mode)
   const submit = () => {
-    if (!draft.trim() || agent.running || needRepo) return
+    if (!draft.trim() || needRepo) return
     void send(draft, selected ? [selected] : [])
     setDraft('')
   }
@@ -208,7 +206,7 @@ export function AgentTab({ selected, onFocusNode }: { selected: string | null; o
       <div className="ag-head">
         <div className="segmented ag-modes" role="radiogroup" aria-label={t('Assistant mode')}>
           {AGENT_MODES.map((m) => (
-            <button key={m} type="button" role="radio" aria-checked={agent.mode === m} className={agent.mode === m ? 'is-on' : undefined} data-tooltip={MODE_HINT()[m]} disabled={agent.running} onClick={() => setMode(m)}>
+            <button key={m} type="button" role="radio" aria-checked={agent.mode === m} className={agent.mode === m ? 'is-on' : undefined} data-tooltip={MODE_HINT()[m]} disabled={agent.running} onClick={() => void setMode(m)}>
               {MODE_LABEL()[m]}
             </button>
           ))}
@@ -225,10 +223,16 @@ export function AgentTab({ selected, onFocusNode }: { selected: string | null; o
 
       {history ? (
         <div className="ag-history">
-          {agent.sessions.length ? (
-            agent.sessions.map((s) => (
+          <div className="ag-history-filter">
+            <span className="cm-muted">{allModes ? t('All conversations') : t('{mode} conversations', { mode: MODE_LABEL()[agent.mode] })}</span>
+            <button type="button" className="button ag-sources-add" onClick={() => setAllModes((v) => !v)}>
+              {allModes ? t('Only this mode') : t('Show all modes')}
+            </button>
+          </div>
+          {sessionsShown.length ? (
+            sessionsShown.map((s) => (
               <div key={s.id} className={'ag-history-row' + (s.id === agent.sessionId ? ' is-on' : '')}>
-                <button type="button" className="ag-history-open" onClick={() => void openSession(s.id).then(() => setHistory(false))}>
+                <button type="button" className="ag-history-open" disabled={agent.running} onClick={() => void openSession(s.id).then((ok) => ok && setHistory(false))}>
                   <span className="ag-history-mode">{MODE_LABEL()[s.mode]}</span>
                   <span className="ag-history-title">{s.title}</span>
                   <span className="ag-history-time">{new Date(s.updatedAt).toLocaleString()}</span>
@@ -261,24 +265,22 @@ export function AgentTab({ selected, onFocusNode }: { selected: string | null; o
         {agent.messages.map((m, i) => (
           <div key={i} className={'ag-msg is-' + m.role}>
             {m.steps?.length ? <Steps steps={m.steps} /> : null}
-            {m.text ? <RichText text={m.text} onNode={onFocusNode} /> : m.role === 'assistant' && agent.running && i === agent.messages.length - 1 ? <Thinking /> : null}
+            {m.text ? <RichText text={m.text} onNode={onFocusNode} /> : null}
+            {m.role === 'assistant' && m.end && m.end !== 'end' ? <EndNote reason={m.end} /> : null}
           </div>
         ))}
         {agent.workers.length ? (
           <div className="ag-workers">
             <div className="cm-lab">{t('Sub-agents')}</div>
             {agent.workers.map((w) => (
-              <button key={w.id} type="button" className={'ag-worker is-' + w.state} onClick={() => onFocusNode(w.node)}>
-                {w.state === 'running' ? <LoaderCircle size={12} className="spin" /> : w.state === 'done' ? <CircleCheck size={12} /> : <CircleAlert size={12} />}
-                <span className="mono">{w.node}</span>
-                {w.note ? <span className="ag-worker-note">{w.note}</span> : null}
-              </button>
+              <Worker key={w.id} worker={w} onFocusNode={onFocusNode} />
             ))}
           </div>
         ) : null}
-        {agent.changeSets.map((c) => (
-          <ChangeSetCard key={c.id} set={c} />
-        ))}
+        {changeSetChains(agent.changeSets).map(({ set, earlier }) =>
+          agent.running && set.status === 'proposed' ? <DraftLine key={set.id} set={set} /> : <ChangeSetCard key={set.id} set={set} earlier={earlier} />
+        )}
+        {agent.running ? <Progress /> : null}
         {agent.gate ? (
           <div className="ag-gate">
             <div className="ag-gate-title">
@@ -339,30 +341,132 @@ export function AgentTab({ selected, onFocusNode }: { selected: string | null; o
               <Square size={12} />
               {t('Stop')}
             </button>
-          ) : (
-            <button type="button" className="button button--primary" disabled={!draft.trim() || needRepo} data-tooltip={needRepo ? t('Pick at least one repository') : undefined} onClick={submit}>
-              <Send size={12} />
-              {t('Send')}
-            </button>
-          )}
+          ) : null}
+          <button
+            type="button"
+            className="button button--primary"
+            disabled={!draft.trim() || needRepo}
+            data-tooltip={needRepo ? t('Pick at least one repository') : agent.running ? t('The assistant reads it before its next step') : undefined}
+            onClick={submit}
+          >
+            <Send size={12} />
+            {t('Send')}
+          </button>
         </div>
       </div>
     </section>
   )
 }
 
-function Thinking() {
+/** A sub-agent: its node, state and latest step; click the row to see every step. */
+function Worker({ worker: w, onFocusNode }: { worker: WorkerView; onFocusNode(id: string): void }) {
+  const [open, setOpen] = useState(false)
+  const last = w.steps[w.steps.length - 1]
   return (
-    <span className="ag-thinking">
-      <LoaderCircle size={12} className="spin" />
-      {t('Working…')}
-    </span>
+    <div className={'ag-worker-box is-' + w.state}>
+      <div className={'ag-worker is-' + w.state}>
+        <button type="button" className="ag-worker-toggle" aria-expanded={open} onClick={() => setOpen((v) => !v)}>
+          <ChevronDown size={12} className={open ? 'is-open' : ''} />
+          {w.state === 'running' ? <LoaderCircle size={12} className="spin" /> : w.state === 'done' ? <CircleCheck size={12} /> : w.state === 'stopped' ? <CircleSlash size={12} /> : <CircleAlert size={12} />}
+        </button>
+        <button type="button" className="ag-worker-node mono" onClick={() => onFocusNode(w.node)}>
+          {w.node}
+        </button>
+        <span className="ag-worker-note">{w.note ?? (last ? last.label : t('Starting…'))}</span>
+        <span className="ag-worker-count">{t('{n} steps', { n: w.steps.filter((s) => s.name !== 'note').length })}</span>
+      </div>
+      {open && w.steps.length ? (
+        <ol className="ag-step-list ag-worker-steps">
+          {w.steps.map((s, i) => (
+            <li key={i} className={(s.name === 'note' ? 'is-note ' : '') + stepClass(s)}>
+              <span className="ag-step-label">{s.label}</span>
+              {s.summary ? <span className="ag-step-sum">{s.summary}</span> : null}
+            </li>
+          ))}
+        </ol>
+      ) : null}
+    </div>
   )
+}
+
+function stepClass(s: AgentStepView): string {
+  if (s.stopped) return 'is-stopped'
+  return s.ok === false ? 'is-bad' : s.ok ? 'is-ok' : 'is-run'
+}
+
+/** While a run goes: what it is doing, how many model calls so far, and for how long. */
+function Progress() {
+  const agent = useAgent()
+  const [, tick] = useState(0)
+  useEffect(() => {
+    const timer = setInterval(() => tick((n) => n + 1), 1000)
+    return () => clearInterval(timer)
+  }, [])
+  const p = agent.progress
+  if (!p) return null
+  const last = [...agent.messages].reverse().find((m) => m.role === 'assistant')
+  const step = [...(last?.steps ?? [])].reverse().find((s) => s.ok === undefined && !s.stopped)
+  const busy = agent.workers.filter((w) => w.state === 'running').length
+  const what =
+    p.phase === 'workers'
+      ? t('Sub-agents working: {busy} of {n} running', { busy, n: agent.workers.length || p.workers || 0 })
+      : p.phase === 'fixing'
+        ? t('Fixing checker errors')
+        : p.phase === 'tools' && step
+          ? step.label
+          : t('Waiting for the model')
+  const secs = Math.max(0, Math.round((Date.now() - p.since) / 1000))
+  const time = secs >= 60 ? `${Math.floor(secs / 60)}m ${secs % 60}s` : `${secs}s`
+  return (
+    <div className="ag-progress" role="status">
+      <LoaderCircle size={12} className="spin" />
+      <span className="ag-progress-what">{what}</span>
+      <span className="ag-progress-meta">
+        {p.turn ? t('round {n}', { n: p.turn }) + ' · ' : ''}
+        {time}
+      </span>
+    </div>
+  )
+}
+
+const END_LABEL = (): Record<AgentEndReason, string> => ({
+  end: t('Done'),
+  gate: t('Waiting for your review'),
+  stopped: t('Stopped'),
+  limit: t('Stopped at the limit'),
+  error: t('Ended with an error')
+})
+
+function EndNote({ reason }: { reason: AgentEndReason }) {
+  return (
+    <div className={'ag-end is-' + reason}>
+      {reason === 'stopped' ? <CircleSlash size={12} /> : reason === 'gate' ? <CircleAlert size={12} /> : <CircleAlert size={12} />}
+      {END_LABEL()[reason]}
+    </div>
+  )
+}
+
+/**
+ * Proposals that continue a rejected one (replaces) are one piece of work: show the newest
+ * version, with how many earlier versions it went through.
+ */
+function changeSetChains(sets: AgentChangeSet[]): Array<{ set: AgentChangeSet; earlier: AgentChangeSet[] }> {
+  const replacedBy = new Map<string, string>()
+  for (const c of sets) if (c.replaces) replacedBy.set(c.replaces, c.id)
+  const byId = new Map(sets.map((c) => [c.id, c]))
+  const out: Array<{ set: AgentChangeSet; earlier: AgentChangeSet[] }> = []
+  for (const c of sets) {
+    if (replacedBy.has(c.id)) continue
+    const earlier: AgentChangeSet[] = []
+    for (let prev = c.replaces ? byId.get(c.replaces) : undefined; prev; prev = prev.replaces ? byId.get(prev.replaces) : undefined) earlier.unshift(prev)
+    out.push({ set: c, earlier })
+  }
+  return out
 }
 
 function Steps({ steps }: { steps: AgentStepView[] }) {
   const [open, setOpen] = useState(false)
-  const running = steps.filter((s) => s.ok === undefined).length
+  const running = steps.filter((s) => s.ok === undefined && !s.stopped).length
   const failed = steps.filter((s) => s.ok === false).length
   return (
     <div className="ag-steps">
@@ -376,7 +480,7 @@ function Steps({ steps }: { steps: AgentStepView[] }) {
       {open ? (
         <ol className="ag-step-list">
           {steps.map((s, i) => (
-            <li key={i} className={s.ok === false ? 'is-bad' : s.ok ? 'is-ok' : 'is-run'}>
+            <li key={i} className={stepClass(s)}>
               <span className="ag-step-label">{s.label}</span>
               {s.summary ? <span className="ag-step-sum">{s.summary}</span> : null}
             </li>
@@ -387,45 +491,57 @@ function Steps({ steps }: { steps: AgentStepView[] }) {
   )
 }
 
-function ChangeSetCard({ set }: { set: AgentChangeSet }) {
+/** While the agent works, a proposal is a draft it is still writing and checking: no buttons yet. */
+function DraftLine({ set }: { set: AgentChangeSet }) {
+  return (
+    <div className="ag-draft">
+      <LoaderCircle size={12} className="spin" />
+      <span className="ag-draft-title">{set.title}</span>
+      <span className="ag-draft-meta">
+        {t('{n} files', { n: Object.keys(set.files).length })} · {t('Checking and fixing')}
+      </span>
+    </div>
+  )
+}
+
+function ChangeSetCard({ set, earlier = [] }: { set: AgentChangeSet; earlier?: AgentChangeSet[] }) {
   const shown = previewing() === set.id
-  const errors = set.problems.filter((p) => p.level === 'error')
-  const warns = set.problems.filter((p) => p.level === 'warn')
   const files = Object.keys(set.files)
   const ops = (op: string) => set.changes.filter((c) => op in c).length
-  const [showProblems, setShowProblems] = useState(false)
+  // Waiting for a decision: open. Applied or rejected: one line, click to open.
+  const [open, setOpen] = useState(set.status === 'proposed')
+  const [more, setMore] = useState(false)
+  useEffect(() => setOpen(set.status === 'proposed'), [set.status])
+  const long = set.summary.length > 160 || set.summary.includes('\n')
   return (
-    <div className={'ag-set is-' + set.status}>
-      <div className="ag-set-head">
+    <div className={'ag-set is-' + set.status + (open ? ' is-open' : '')}>
+      <button type="button" className="ag-set-head" aria-expanded={open} onClick={() => setOpen((v) => !v)}>
+        <ChevronDown size={12} className={open ? 'is-open' : ''} />
         <span className="ag-set-title">
           {set.requirement ? t('Requirement') + ' · ' : ''}
           {set.title}
         </span>
+        {earlier.length ? <span className="ag-set-rev">{t('revised {n} times', { n: earlier.length })}</span> : null}
         <span className="ag-set-status">{set.status === 'applied' ? t('Applied') : set.status === 'rejected' ? t('Rejected') : t('Proposed')}</span>
-      </div>
-      {set.summary ? <p className="cm-desc">{set.summary}</p> : null}
+      </button>
+      {!open ? null : (
+        <>
+      {set.summary ? (
+        <div className="ag-set-summary">
+          <p className={'cm-desc' + (long && !more ? ' is-clamped' : '')}>{set.summary}</p>
+          {long ? (
+            <button type="button" className="ag-set-more" onClick={() => setMore((v) => !v)}>
+              {more ? t('Show less') : t('Show more')}
+            </button>
+          ) : null}
+        </div>
+      ) : null}
       <div className="cm-req-meta">
         <span className="is-add">+{ops('add')}</span>
         <span className="is-mod">~{ops('modify')}</span>
         <span className="is-del">−{ops('remove')}</span>
         {files.length ? <span>{t('{n} files', { n: files.length })}</span> : null}
-        {errors.length || warns.length ? (
-          <button type="button" className={'ag-set-problems' + (errors.length ? ' is-bad' : ' is-warn')} onClick={() => setShowProblems((v) => !v)}>
-            {errors.length ? t('{n} errors', { n: errors.length }) : t('{n} warnings', { n: warns.length })}
-          </button>
-        ) : (
-          <span className="is-add">{t('Checks passed')}</span>
-        )}
       </div>
-      {showProblems ? (
-        <div className="ag-set-problem-list">
-          {set.problems.map((p, i) => (
-            <div key={i} className="cm-issue">
-              <b className={'is-' + p.level}>{p.level}</b> <span className="mono">[{p.rule}]</span> {p.msg}
-            </div>
-          ))}
-        </div>
-      ) : null}
       {files.length ? (
         <details className="ag-set-files">
           <summary>{t('Files')}</summary>
@@ -446,12 +562,14 @@ function ChangeSetCard({ set }: { set: AgentChangeSet }) {
             <X size={13} />
             {t('Reject')}
           </button>
-          <button type="button" className="button button--primary" disabled={errors.length > 0} data-tooltip={errors.length ? t('Fix the errors first (ask the assistant)') : undefined} onClick={() => void applyChangeSet(set)}>
+          <button type="button" className="button button--primary" onClick={() => void applyChangeSet(set)}>
             <Check size={13} />
             {set.requirement ? t('Save requirement') : t('Apply')}
           </button>
         </div>
       ) : null}
+        </>
+      )}
     </div>
   )
 }

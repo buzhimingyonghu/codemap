@@ -70,7 +70,7 @@ try {
     await app.evaluate(({ dialog }, dir) => {
       dialog.showOpenDialog = async () => ({ canceled: false, filePaths: [dir] })
     }, path.join(folder, 'demo-repos'))
-    await page.locator('.ag-sources-add').first().click()
+    await page.locator('.ag-sources-add', { hasText: /Add folders/ }).click()
     await page.waitForSelector('.ag-source:has-text("demo-repos")', { timeout: 5000 })
     await page.locator('.ag-link-input').fill('https://wiki.example.com/p/2002')
     await page.keyboard.press('Enter')
@@ -106,7 +106,7 @@ try {
   })
 
   await step('adjust: a change set previews on the map and applies', async () => {
-    await page.locator('.ag-head-tools button').nth(1).click()
+    // Switching modes opens that mode's own conversation; the Ask one stays as it is.
     await page.locator('.ag-modes button', { hasText: /Adjust map/ }).click()
     await page.locator('.ag-input').fill('把 order-svc 里「落库」这个节点改名为「保存订单」，其他不动。')
     await page.locator('.ag-compose-bar .button--primary').click()
@@ -127,6 +127,35 @@ try {
   await step('conversations are kept', async () => {
     const list = await page.evaluate(() => window.codemap.agent.sessions())
     if (list.length < 2) throw new Error('Expected two conversations, got ' + list.length)
+  })
+
+  await step('each mode keeps its own conversation', async () => {
+    // Adjust is open now; Ask goes back to the Ask conversation, not the Adjust one.
+    const before = await page.locator('.ag-msg.is-user').allTextContents()
+    await page.locator('.ag-modes button', { hasText: /^Ask$/ }).click()
+    await page.waitForTimeout(500)
+    const ask = await page.locator('.ag-msg.is-user').allTextContents()
+    if (!ask.some((t) => t.includes('库存不足'))) throw new Error('Ask did not reopen its conversation: ' + ask.join(' | '))
+    if (ask.join() === before.join()) throw new Error('Ask shows the Adjust conversation')
+    // The history list shows only this mode's conversations by default.
+    await page.locator('.ag-head-tools button').first().click()
+    const modes = await page.locator('.ag-history-mode').allTextContents()
+    if (!modes.length || modes.some((m) => m !== 'Ask')) throw new Error('History mixes modes: ' + modes.join(', '))
+    await page.locator('.ag-head-tools button').first().click()
+  })
+
+  await step('a saved build conversation reopens with its repositories and knowledge', async () => {
+    // Save a build conversation directly in the main process (no model call needed).
+    const repo = path.join(folder, 'demo-repos')
+    await page.evaluate(async (repo) => {
+      const id = await window.codemap.agent.start({ mode: 'create', message: 'build', context: { stack: [], selected: [], flow: null, repos: [repo], docs: [{ kind: 'url', value: 'https://wiki.example.com/p/2002' }], output: '' } })
+      await window.codemap.agent.stop(id)
+      localStorage.setItem('agent.lastSession', JSON.stringify({ ...JSON.parse(localStorage.getItem('agent.lastSession') || '{}'), create: id }))
+    }, repo)
+    await page.waitForTimeout(1500)
+    await page.locator('.ag-modes button', { hasText: /Build map/ }).click()
+    await page.waitForSelector('.ag-source:has-text("demo-repos")', { timeout: 5000 })
+    await page.waitForSelector('.ag-source:has-text("wiki.example.com")', { timeout: 5000 })
   })
 
   await step('no page errors', async () => {

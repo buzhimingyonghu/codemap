@@ -3292,6 +3292,8 @@ button.status-item:hover {
   /* To-dos. */
   --cm-todo: #f0a63a;
   --cm-trace: var(--warning);
+  /* The assistant is looking at (or changing) this node. */
+  --cm-agent: var(--warning);
   --cm-node: var(--bg-elevated);
   --cm-node-stroke: var(--border-strong);
   --cm-line: color-mix(in srgb, var(--fg-muted) 55%, transparent);
@@ -3753,18 +3755,41 @@ button.status-item:hover {
   stroke-width: 2.5;
 }
 .cm-node.agent .cm-shape {
-  stroke: var(--accent);
+  stroke: var(--cm-agent);
   stroke-width: 3;
-  animation: cm-agent-pulse 1.4s ease-in-out infinite;
+  fill: color-mix(in srgb, var(--cm-agent) 18%, var(--cm-node));
+  animation: cm-agent-glow 1.6s ease-in-out infinite;
 }
-@keyframes cm-agent-pulse {
+/* Only the glow breathes; the border stays solid so the node is always easy to see. */
+@keyframes cm-agent-glow {
   0%,
   100% {
-    stroke-opacity: 1;
+    filter: drop-shadow(0 0 2px color-mix(in srgb, var(--cm-agent) 45%, transparent));
   }
   50% {
-    stroke-opacity: 0.35;
+    filter: drop-shadow(0 0 10px color-mix(in srgb, var(--cm-agent) 85%, transparent));
   }
+}
+.cm-node.agent-trail .cm-shape {
+  stroke: color-mix(in srgb, var(--cm-agent) 55%, var(--cm-node-stroke));
+  stroke-width: 2;
+  stroke-dasharray: 6 3;
+}
+.cm-agent-note {
+  pointer-events: none;
+}
+.cm-agent-note rect,
+.cm-agent-note path {
+  fill: var(--cm-agent);
+}
+.cm-agent-note text {
+  fill: #1c1917;
+  font-size: 11px;
+  font-weight: 600;
+  text-anchor: middle;
+}
+[data-theme='paper'] .cm-agent-note text {
+  fill: #ffffff;
 }
 .cm-node .cm-rtag {
   font-size: 10px;
@@ -5599,9 +5624,75 @@ button.status-item:hover {
   color: var(--danger);
 }
 .ag-worker-note {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--fg-muted);
+  font-size: var(--font-size-tiny);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ag-worker-box {
+  display: flex;
+  flex-direction: column;
+}
+.ag-worker-toggle,
+.ag-worker-node {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+}
+.ag-worker-toggle svg.is-open {
+  transform: none;
+}
+.ag-worker-toggle svg:first-child:not(.is-open) {
+  transform: rotate(-90deg);
+}
+.ag-worker-node:hover {
+  color: var(--fg-primary);
+  text-decoration: underline;
+}
+.ag-worker-count {
+  flex: none;
   color: var(--fg-muted);
   font-size: var(--font-size-tiny);
 }
+.ag-worker-steps {
+  max-height: 220px;
+  margin: 2px 0 4px 22px;
+  overflow: auto;
+}
+.ag-step-list li.is-note .ag-step-label {
+  color: var(--fg-secondary);
+  font-style: italic;
+}
+.ag-draft {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  border: 1px dashed var(--border-strong);
+  border-radius: var(--radius-md);
+  color: var(--fg-secondary);
+  font-size: var(--font-size-small);
+}
+.ag-draft-title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ag-draft-meta {
+  flex: none;
+  color: var(--fg-muted);
+  font-size: var(--font-size-tiny);
+}
+
 .ag-set {
   display: flex;
   flex-direction: column;
@@ -5622,8 +5713,109 @@ button.status-item:hover {
 }
 .ag-set-head {
   display: flex;
-  align-items: baseline;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  text-align: left;
+}
+.ag-set-head svg {
+  flex: none;
+  transform: rotate(-90deg);
+  transition: transform 0.12s;
+}
+.ag-set-head svg.is-open {
+  transform: none;
+}
+.ag-set:not(.is-open) {
+  padding: 6px 10px;
+}
+.ag-set-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ag-set.is-open .ag-set-title {
+  white-space: normal;
+}
+.ag-set-rev {
+  flex: none;
+  color: var(--fg-muted);
+  font-size: var(--font-size-tiny);
+}
+.ag-set-summary .cm-desc {
+  margin: 0;
+  white-space: pre-wrap;
+}
+.ag-set-summary .cm-desc.is-clamped {
+  display: -webkit-box;
+  overflow: hidden;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+}
+.ag-set-more {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--accent);
+  font-size: var(--font-size-tiny);
+}
+.ag-progress {
+  position: sticky;
+  bottom: 0;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-elevated);
+  color: var(--fg-secondary);
+  font-size: var(--font-size-tiny);
+}
+.ag-progress-what {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ag-progress-meta {
+  flex: none;
+  color: var(--fg-muted);
+}
+.ag-end {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: 4px;
+  color: var(--fg-muted);
+  font-size: var(--font-size-tiny);
+}
+.ag-end.is-error {
+  color: var(--danger);
+}
+.ag-end.is-gate {
+  color: var(--warning);
+}
+.ag-step-list li.is-stopped {
+  color: var(--fg-muted);
+  text-decoration: line-through;
+}
+.ag-worker.is-stopped svg {
+  color: var(--fg-muted);
+}
+.ag-history-filter {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
   gap: 8px;
+  padding: 2px 4px 6px;
+  font-size: var(--font-size-tiny);
 }
 .ag-set-title {
   flex: 1;

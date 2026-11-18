@@ -30,8 +30,6 @@ export interface AgentSettings {
   modeModels: ModeModels
   /** Parallel sub-agents allowed in create mode. */
   maxParallel: number
-  /** Stop a run after this many model turns. */
-  maxTurns: number
 }
 
 /** What the user is looking at when a message is sent. */
@@ -60,6 +58,18 @@ export interface AgentStartRequest {
   model?: string
 }
 
+/** Build map: the repositories, knowledge and output folder a conversation works from. Saved with it. */
+export interface AgentSources {
+  repos: string[]
+  docs: Array<{ kind: 'file' | 'url'; value: string }>
+  output: string
+}
+
+/** What a run is doing right now, shown above the input while it goes. */
+export type AgentPhase = 'thinking' | 'tools' | 'fixing' | 'workers'
+
+export type AgentEndReason = 'end' | 'gate' | 'stopped' | 'limit' | 'error'
+
 // ---------- Change sets ----------
 // The agent never writes node YAML directly. It proposes a change set (the same `changes`
 // format as requirements/*.yaml plus whole new node files), the map previews it as a layer,
@@ -79,6 +89,8 @@ export interface AgentChangeSet {
   /** Problems the checker found with this change set applied. */
   problems: { level: string; rule: string; where: string; msg: string }[]
   status: 'proposed' | 'applied' | 'rejected'
+  /** The rejected proposal this one continues: the panel shows them as one card. */
+  replaces?: string
 }
 
 // ---------- Events the panel receives while a run goes ----------
@@ -93,16 +105,22 @@ export type AgentEvent =
   | { type: 'changeset'; sessionId: string; runId: string; changeSet: AgentChangeSet }
   /** Create mode: a review gate; the run stops until the user approves or sends feedback. */
   | { type: 'gate'; sessionId: string; runId: string; stage: string; summary: string }
-  | { type: 'worker'; sessionId: string; runId: string; workerId: string; node: string; state: 'running' | 'done' | 'failed'; note?: string }
+  | { type: 'worker'; sessionId: string; runId: string; workerId: string; node: string; state: 'running' | 'done' | 'failed' | 'stopped'; note?: string }
+  /** A sub-agent's progress: a tool step (ok/summary when it finished), a line it wrote, or nodes it points at. */
+  | { type: 'worker-step'; sessionId: string; runId: string; workerId: string; node: string; label: string; ok?: boolean; summary?: string; lit?: string[]; note?: boolean }
   | { type: 'usage'; sessionId: string; runId: string; input: number; output: number }
+  /** The run moved to another phase; turn counts model calls in this run. */
+  | { type: 'phase'; sessionId: string; runId: string; phase: AgentPhase; turn: number; label?: string }
   | { type: 'error'; sessionId: string; runId: string; message: string }
-  | { type: 'done'; sessionId: string; runId: string; reason: 'end' | 'gate' | 'stopped' | 'limit' | 'error' }
+  | { type: 'done'; sessionId: string; runId: string; reason: AgentEndReason }
 
 export interface AgentStepView {
   name: string
   label: string
   summary?: string
   ok?: boolean
+  /** The run was stopped before this step finished. */
+  stopped?: boolean
 }
 
 export interface AgentMessageView {
@@ -111,6 +129,8 @@ export interface AgentMessageView {
   /** Tool steps taken while producing an assistant message. */
   steps?: AgentStepView[]
   at: number
+  /** How the run that wrote this reply ended (missing while it goes, and in old sessions). */
+  end?: AgentEndReason
 }
 
 export interface AgentSessionInfo {
@@ -122,6 +142,8 @@ export interface AgentSessionInfo {
   changeSets: AgentChangeSet[]
   /** Create mode: the gate the session is waiting at, if any. */
   gate?: { stage: string; summary: string } | null
+  /** Build map: what the conversation works from. */
+  sources?: AgentSources
 }
 
 export interface AgentSessionSummary {

@@ -12,9 +12,7 @@ interface Stored extends AgentSettings {
   keys: Record<string, string>
 }
 
-const DEFAULT_TURNS = 1000
-const MAX_TURNS = 5000
-const DEFAULTS: Stored = { providers: defaultProviders(), activeProvider: LOCAL_GATEWAY_ID, modeModels: {}, maxParallel: 3, maxTurns: DEFAULT_TURNS, keys: {} }
+const DEFAULTS: Stored = { providers: defaultProviders(), activeProvider: LOCAL_GATEWAY_ID, modeModels: {}, maxParallel: 3, keys: {} }
 
 let cached: Stored | null = null
 
@@ -33,9 +31,9 @@ async function load(): Promise<Stored> {
     // The local gateway is always offered, even if an older file removed it.
     if (!providers.some((p) => p.id === LOCAL_GATEWAY_ID)) providers.unshift(defaultProviders()[0])
     const activeProvider = saved.find((p) => p.id === parsed.activeProvider && legacy(p)) ? LOCAL_GATEWAY_ID : (parsed.activeProvider ?? LOCAL_GATEWAY_ID)
-    // 40 was the old default; a map build needs far more turns, so lift files that kept it.
-    const maxTurns = !parsed.maxTurns || parsed.maxTurns === 40 ? DEFAULT_TURNS : parsed.maxTurns
-    cached = { ...DEFAULTS, ...parsed, maxTurns, providers, activeProvider, modeModels: { ...(parsed.modeModels ?? {}) }, keys: { ...(parsed.keys ?? {}) } }
+    // Older files carry maxTurns; runs have no turn limit any more, so it is dropped.
+    const { maxTurns: _old, ...rest } = parsed as Partial<Stored> & { maxTurns?: number }
+    cached = { ...DEFAULTS, ...rest, providers, activeProvider, modeModels: { ...(parsed.modeModels ?? {}) }, keys: { ...(parsed.keys ?? {}) } }
   } catch {
     cached = structuredClone(DEFAULTS)
   }
@@ -53,8 +51,7 @@ function publicView(s: Stored): AgentSettings {
     providers: s.providers.map((p) => ({ ...p, hasKey: p.keySource === 'local' ? undefined : Boolean(s.keys[p.id]) })),
     activeProvider: s.activeProvider,
     modeModels: s.modeModels,
-    maxParallel: s.maxParallel,
-    maxTurns: s.maxTurns
+    maxParallel: s.maxParallel
   }
 }
 
@@ -93,7 +90,6 @@ export async function saveAgentSettings(next: AgentSettings): Promise<AgentSetti
     activeProvider: providers.some((p) => p.id === next.activeProvider) ? next.activeProvider : providers[0].id,
     modeModels: Object.fromEntries(Object.entries(next.modeModels ?? {}).filter(([, v]) => typeof v === 'string' && v)) as AgentSettings['modeModels'],
     maxParallel: Math.max(1, Math.min(8, Math.round(Number(next.maxParallel) || 3))),
-    maxTurns: Math.max(5, Math.min(MAX_TURNS, Math.round(Number(next.maxTurns) || DEFAULT_TURNS))),
     keys
   })
   return getAgentSettings()

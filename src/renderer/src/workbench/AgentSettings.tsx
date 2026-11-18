@@ -145,8 +145,6 @@ export function AgentSettingsSection() {
         <div className="ai-grid">
           <span>{t('Parallel sub-agents')}</span>
           <input className="input mono" type="number" min={1} max={8} value={s.maxParallel} onChange={(e) => setS({ ...s, maxParallel: Number(e.target.value) })} />
-          <span>{t('Max turns per run')}</span>
-          <input className="input mono" type="number" min={5} max={5000} value={s.maxTurns} onChange={(e) => setS({ ...s, maxTurns: Number(e.target.value) })} />
         </div>
       </div>
 

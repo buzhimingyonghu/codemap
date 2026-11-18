@@ -4,7 +4,7 @@ import path from 'node:path'
 import { app } from 'electron'
 import yaml from 'js-yaml'
 import { stringify as toYaml } from 'yaml'
-import type { AgentChangeSet, AgentEvent, AgentMessageView, AgentSessionInfo, AgentSessionSummary, AgentStartRequest } from '../../shared/agent'
+import type { AgentChangeSet, AgentContext, AgentEndReason, AgentEvent, AgentMessageView, AgentPhase, AgentSessionInfo, AgentSessionSummary, AgentStartRequest } from '../../shared/agent'
 import { isInside } from '../../shared/paths'
 import type { CodemapAccess } from '../codemap/service'
 import { callModel, type Block, type Message } from './providers'
@@ -92,13 +92,22 @@ export async function startRun(library: string, access: CodemapAccess, req: Agen
   let s: Session
   if (req.sessionId) {
     s = await loadSession(library, req.sessionId)
-    if (running.has(s.id)) throw new Error('This conversation is still running')
+    // A conversation belongs to the mode it was started in; another mode starts its own.
+    if (s.mode !== req.mode) throw new Error(`This conversation belongs to the ${s.mode} mode; start a new conversation for ${req.mode}`)
+    // A message sent while the run goes is queued and read by the run before its next model turn.
+    if (running.has(s.id)) {
+      s.messages.push({ role: 'user', text: req.message, at: Date.now() })
+      ;(inbox.get(s.id) ?? inbox.set(s.id, []).get(s.id)!).push(req.message)
+      void persist(s)
+      return s.id
+    }
   } else {
     s = { id: randomUUID(), library, mode: req.mode, title: makeTitle(req.message), updatedAt: Date.now(), messages: [], changeSets: [], history: [], gate: null }
     sessions.set(s.id, s)
   }
-  s.mode = req.mode
   s.gate = null
+  // Build map: the repositories and knowledge are kept with the conversation.
+  if (s.mode === 'create' && req.context.repos) s.sources = { repos: req.context.repos, docs: req.context.docs ?? [], output: req.context.output ?? '' }
   s.messages.push({ role: 'user', text: req.message, at: Date.now() })
   s.history.push({ role: 'user', content: [{ type: 'text', text: req.message }] })
   s.updatedAt = Date.now()
@@ -110,64 +119,144 @@ export async function startRun(library: string, access: CodemapAccess, req: Agen
   running.set(s.id, controller)
   void runLoop(s, access, req, runId, controller, emit).finally(() => {
     running.delete(s.id)
+    inbox.delete(s.id)
     void persist(s)
   })
   return s.id
+}
+
+/** Messages the user sent while a run was going, waiting for the run's next turn. */
+const inbox = new Map<string, string[]>()
+
+const CUT_OFF =
+  'Your last reply was cut off by the output limit, so any tool call in it was lost. Continue from where you stopped. If you were proposing a change set, split it: propose one or two files per propose_change_set call.'
+
+interface LoopHooks {
+  /** Called with every text block (main run: shown in the chat). */
+  onText(text: string): void
+  /** Wraps each tool call (main run: shown as steps). */
+  onTool(name: string, label: string): (ok: boolean, summary: string) => void
+  /** Messages to add before the next model turn (user messages typed while running). */
+  pending?(): string[]
+  /** Stop after this turn (a review gate was reached). */
+  halt?(): boolean
+  /** Asked when the model ends without a tool call: a nudge to keep going, or null to finish. */
+  nudge?(): string | null
+  /** After each turn (persist). */
+  after?(): void
+  /** Before each model call: what the run is doing and how many calls it made. */
+  phase?(phase: AgentPhase, turn: number): void
+}
+
+/**
+ * The model ↔ tools loop shared by the main run and sub-agents. No turn limit: it ends when the
+ * model is done (no tool call and no nudge), at a review gate, or when stopped. A reply cut off
+ * by the output limit is continued instead of being taken as the end.
+ */
+async function turnLoop(
+  ctx: { provider: Awaited<ReturnType<typeof resolveProvider>>['provider']; key: string; model: string; system: string; signal: AbortSignal },
+  history: Message[],
+  defs: ReturnType<typeof toolsFor>,
+  env: ToolEnv,
+  emitUsage: (input: number, output: number) => void,
+  hooks: LoopHooks
+): Promise<'end' | 'gate' | 'stopped'> {
+  let turn = 0
+  let fixing = false
+  for (;;) {
+    if (ctx.signal.aborted) return 'stopped'
+    hooks.phase?.(fixing ? 'fixing' : 'thinking', ++turn)
+    const extra = hooks.pending?.() ?? []
+    if (extra.length) {
+      const last = history[history.length - 1]
+      const blocks: Block[] = extra.map((text) => ({ type: 'text', text: `(Message from the user while you were working) ${text}` }))
+      if (last?.role === 'user') last.content.push(...blocks)
+      else history.push({ role: 'user', content: blocks })
+    }
+    const answer = await callModel(ctx.provider, ctx.key, { model: ctx.model, system: ctx.system, messages: history, tools: defs.map((d) => d.spec), signal: ctx.signal })
+    emitUsage(answer.usage.input, answer.usage.output)
+    const cut = answer.stop === 'length'
+    // A cut-off reply may end in a half-written tool call: keep only its text.
+    const blocks = cut ? answer.blocks.filter((b) => b.type === 'text') : answer.blocks
+    history.push({ role: 'assistant', content: blocks.length ? blocks : [{ type: 'text', text: '…' }] })
+    for (const b of blocks) if (b.type === 'text') hooks.onText(b.text)
+    const calls = blocks.filter((b) => b.type === 'tool_use') as Array<Extract<Block, { type: 'tool_use' }>>
+    if (!calls.length) {
+      const next = cut ? CUT_OFF : (hooks.pending?.().length ? null : hooks.nudge?.() ?? null)
+      if (next) {
+        fixing = next !== CUT_OFF
+        history.push({ role: 'user', content: [{ type: 'text', text: next }] })
+        hooks.after?.()
+        continue
+      }
+      // Messages typed during the last turn still get an answer.
+      const late = hooks.pending?.() ?? []
+      if (late.length) {
+        history.push({ role: 'user', content: late.map((text) => ({ type: 'text', text })) })
+        hooks.after?.()
+        continue
+      }
+      return 'end'
+    }
+    fixing = false
+    const results: Block[] = []
+    for (const call of calls) {
+      if (ctx.signal.aborted) return 'stopped'
+      const done = hooks.onTool(call.name, toolLabel(defs, call.name, call.input))
+      const result = await runTool(defs, env, call.name, call.input)
+      done(result.ok, result.summary)
+      results.push({ type: 'tool_result', id: call.id, content: result.content, isError: !result.ok })
+    }
+    history.push({ role: 'user', content: results })
+    hooks.after?.()
+    if (hooks.halt?.()) return 'gate'
+  }
 }
 
 async function runLoop(s: Session, access: CodemapAccess, req: AgentStartRequest, runId: string, controller: AbortController, emit: Emit): Promise<void> {
   const settings = await rawAgentSettings()
   const reply: AgentMessageView = { role: 'assistant', text: '', steps: [], at: Date.now() }
   s.messages.push(reply)
-  let reason: 'end' | 'gate' | 'stopped' | 'limit' | 'error' = 'end'
+  let reason: AgentEndReason = 'end'
   try {
     const { provider, key } = await resolveProvider()
     const model = req.model || settings.modeModels[s.mode] || provider.model
     if (!model) throw new Error(`No model chosen for ${provider.name}: pick one in Settings → AI`)
-    const env = makeEnv(s, access, runId, emit, settings.maxParallel, provider, key, model, controller.signal, undefined, settings.maxTurns)
+    const runSets = new Set<string>()
+    let fixNudges = 0
+    const env = makeEnv(s, access, runId, emit, settings.maxParallel, provider, key, model, controller.signal, undefined, (id) => runSets.add(id))
     const defs = toolsFor(s.mode)
-    const system = await systemPrompt(s.library, s.mode, req.context)
-    let turns = 0
-    for (;;) {
-      if (controller.signal.aborted) {
-        reason = 'stopped'
-        break
-      }
-      if (++turns > settings.maxTurns) {
-        reason = 'limit'
-        emit({ type: 'error', sessionId: s.id, runId, message: `Stopped after ${settings.maxTurns} model turns. Send a message to continue.` })
-        break
-      }
-      const answer = await callModel(provider, key, { model, system, messages: s.history, tools: defs.map((d) => d.spec), signal: controller.signal })
-      emit({ type: 'usage', sessionId: s.id, runId, input: answer.usage.input, output: answer.usage.output })
-      s.history.push({ role: 'assistant', content: answer.blocks })
-      for (const b of answer.blocks) {
-        if (b.type !== 'text') continue
-        reply.text += (reply.text ? '\n\n' : '') + b.text
-        emit({ type: 'text', sessionId: s.id, runId, text: b.text })
-      }
-      const calls = answer.blocks.filter((b) => b.type === 'tool_use') as Array<Extract<Block, { type: 'tool_use' }>>
-      if (!calls.length) break
-      const results: Block[] = []
-      for (const call of calls) {
-        const label = toolLabel(defs, call.name, call.input)
-        emit({ type: 'tool', sessionId: s.id, runId, callId: call.id, name: call.name, label })
-        const step = { name: call.name, label, summary: undefined as string | undefined, ok: undefined as boolean | undefined }
+    const system = await systemPrompt(s.library, s.mode, withSources(s, req.context))
+    reason = await turnLoop({ provider, key, model, system, signal: controller.signal }, s.history, defs, env, (input, output) => emit({ type: 'usage', sessionId: s.id, runId, input, output }), {
+      onText: (text) => {
+        reply.text += (reply.text ? '\n\n' : '') + text
+        emit({ type: 'text', sessionId: s.id, runId, text })
+      },
+      onTool: (name, label) => {
+        const callId = randomUUID().slice(0, 8)
+        emit({ type: 'tool', sessionId: s.id, runId, callId, name, label })
+        const step = { name, label, summary: undefined as string | undefined, ok: undefined as boolean | undefined }
         reply.steps!.push(step)
-        const result = await runTool(defs, env, call.name, call.input)
-        step.summary = result.summary
-        step.ok = result.ok
-        emit({ type: 'tool-result', sessionId: s.id, runId, callId: call.id, ok: result.ok, summary: result.summary })
-        results.push({ type: 'tool_result', id: call.id, content: result.content, isError: !result.ok })
-      }
-      s.history.push({ role: 'user', content: results })
-      s.updatedAt = Date.now()
-      void persist(s)
-      if (s.gate) {
-        reason = 'gate'
-        break
-      }
-    }
+        return (ok, summary) => {
+          step.ok = ok
+          step.summary = summary
+          emit({ type: 'tool-result', sessionId: s.id, runId, callId, ok, summary })
+        }
+      },
+      pending: () => takeInbox(s.id),
+      halt: () => Boolean(s.gate),
+      // Its own proposals from this run that still fail the checker: send it back to fix them.
+      nudge: () => {
+        const broken = s.changeSets.filter((c) => c.status === 'proposed' && runSets.has(c.id) && c.problems.some((p) => p.level === 'error'))
+        if (!broken.length || fixNudges++ >= 20) return null
+        return BROKEN(broken)
+      },
+      after: () => {
+        s.updatedAt = Date.now()
+        void persist(s)
+      },
+      phase: (phase, turn) => emit({ type: 'phase', sessionId: s.id, runId, phase, turn })
+    })
   } catch (error) {
     if (controller.signal.aborted) reason = 'stopped'
     else {
@@ -176,14 +265,31 @@ async function runLoop(s: Session, access: CodemapAccess, req: AgentStartRequest
       reply.text += (reply.text ? '\n\n' : '') + `⚠️ ${message}`
       emit({ type: 'error', sessionId: s.id, runId, message })
     }
-    // Keep the history valid for the next message: a trailing assistant tool call needs results.
-    const last = s.history[s.history.length - 1]
-    if (last?.role === 'assistant' && last.content.some((b) => b.type === 'tool_use')) {
-      s.history.push({ role: 'user', content: last.content.filter((b) => b.type === 'tool_use').map((b) => ({ type: 'tool_result', id: (b as { id: string }).id, content: 'Interrupted.', isError: true })) })
-    }
   }
+  // Keep the history valid for the next message: a trailing assistant tool call needs results.
+  const last = s.history[s.history.length - 1]
+  if (last?.role === 'assistant' && last.content.some((b) => b.type === 'tool_use')) {
+    s.history.push({ role: 'user', content: last.content.filter((b) => b.type === 'tool_use').map((b) => ({ type: 'tool_result', id: (b as { id: string }).id, content: 'Interrupted.', isError: true })) })
+  }
+  // Messages that arrived after the last turn: keep them in the history for the next run.
+  const left = takeInbox(s.id)
+  if (left.length) s.history.push({ role: 'user', content: left.map((text) => ({ type: 'text', text })) })
+  // A stop or an error leaves steps that never finished: mark them so they do not spin forever.
+  if (reason === 'stopped' || reason === 'error') for (const step of reply.steps ?? []) if (step.ok === undefined) step.stopped = true
+  reply.end = reason
   s.updatedAt = Date.now()
   emit({ type: 'done', sessionId: s.id, runId, reason })
+}
+
+/** Build map: a continued conversation keeps working from the sources saved with it. */
+function withSources(s: Session, context: AgentContext): AgentContext {
+  if (s.mode !== 'create' || !s.sources) return context
+  return { ...context, repos: s.sources.repos, docs: s.sources.docs, output: s.sources.output }
+}
+
+function takeInbox(id: string): string[] {
+  const q = inbox.get(id)
+  return q ? q.splice(0) : []
 }
 
 function makeEnv(
@@ -196,54 +302,102 @@ function makeEnv(
   key: string,
   model: string,
   signal: AbortSignal,
-  scope?: string,
-  maxTurns = 1000
+  worker?: { scope: string; workerId: string; node: string; proposed: () => void },
+  onProposed?: (id: string) => void
 ): ToolEnv {
+  const scope = worker?.scope
   return {
     library: s.library,
     access,
-    mode: s.mode,
-    focus: (map, nodes, flow, note) => emit({ type: 'focus', sessionId: s.id, runId, map, nodes, flow, note }),
-    propose: (input) => {
+    mode: s.mode === 'create' || !worker ? s.mode : 'create',
+    focus: (map, nodes, flow, note) => {
+      // A sub-agent lights up nodes too, but does not move the map away from the main agent.
+      if (worker) emit({ type: 'worker-step', sessionId: s.id, runId, workerId: worker.workerId, node: worker.node, label: note ?? '', lit: nodes, note: true })
+      else emit({ type: 'focus', sessionId: s.id, runId, map, nodes, flow, note })
+    },
+    propose: (input, extend) => {
       if (scope) {
         for (const rel of Object.keys(input.files)) {
           if (!isInside(path.join(s.library, scope), path.join(s.library, rel))) throw new Error(`Sub-agent for ${scope} may only write files under ${scope}/: ${rel}`)
         }
       }
-      const set: AgentChangeSet = { ...input, id: randomUUID().slice(0, 8), sessionId: s.id, problems: checkChangeSet(s.library, input), status: 'proposed' }
-      s.changeSets.push(set)
+      let set: AgentChangeSet
+      if (extend) {
+        // Grow an earlier proposal: same id and card, checked again as a whole.
+        const old = s.changeSets.find((c) => c.id === extend)
+        if (!old) throw new Error(`No proposal ${extend} in this conversation`)
+        if (old.status === 'applied') throw new Error(`Proposal ${extend} is already applied; make a new proposal for further changes`)
+        const files = { ...old.files, ...input.files }
+        const changes = [...old.changes, ...input.changes]
+        // The card shows the latest description, not every revision appended.
+        const summary = input.summary || old.summary
+        if (old.status === 'rejected') {
+          // The user rejected that version: carry its content into a fresh proposal instead of failing.
+          set = { title: input.title || old.title, summary, files, changes, requirement: input.requirement ?? old.requirement, id: randomUUID().slice(0, 8), sessionId: s.id, problems: checkChangeSet(s.library, { files, changes }), status: 'proposed', replaces: old.id }
+          s.changeSets.push(set)
+        } else {
+          Object.assign(old, { files, changes, summary, problems: checkChangeSet(s.library, { files, changes }) })
+          set = old
+        }
+      } else {
+        set = { ...input, id: randomUUID().slice(0, 8), sessionId: s.id, problems: checkChangeSet(s.library, input), status: 'proposed' }
+        s.changeSets.push(set)
+      }
       emit({ type: 'changeset', sessionId: s.id, runId, changeSet: set })
+      worker?.proposed()
+      onProposed?.(set.id)
       return set
     },
     gate: (stage, summary) => {
+      // The user reviews the architecture and the logic, never checker errors: those are fixed first.
+      const broken = s.changeSets.filter((c) => c.status === 'proposed' && c.problems.some((p) => p.level === 'error'))
+      if (broken.length) throw new Error(BROKEN(broken))
       s.gate = { stage, summary }
       emit({ type: 'gate', sessionId: s.id, runId, stage, summary })
     },
-    delegate: scope
+    delegate: worker
       ? undefined
       : async (tasks) => {
           const queue = [...tasks]
           const reports: string[] = []
-          const worker = async () => {
-            for (let t = queue.shift(); t; t = queue.shift()) {
+          emit({ type: 'phase', sessionId: s.id, runId, phase: 'workers', turn: 0, label: String(tasks.length) })
+          const run = async () => {
+            for (let t = queue.shift(); t && !signal.aborted; t = queue.shift()) {
               const workerId = randomUUID().slice(0, 6)
               emit({ type: 'worker', sessionId: s.id, runId, workerId, node: t.node, state: 'running' })
               try {
-                const report = await runSubAgent(s, access, t.node, t.instructions, runId, emit, provider, key, model, signal, maxTurns)
+                const report = await runSubAgent(s, access, t.node, t.instructions, runId, workerId, emit, provider, key, model, signal)
                 reports.push(`## ${t.node}\n${report}`)
-                emit({ type: 'worker', sessionId: s.id, runId, workerId, node: t.node, state: 'done' })
+                emit({ type: 'worker', sessionId: s.id, runId, workerId, node: t.node, state: signal.aborted ? 'stopped' : 'done' })
               } catch (error) {
                 const message = error instanceof Error ? error.message : String(error)
                 reports.push(`## ${t.node}\nFailed: ${message}`)
-                emit({ type: 'worker', sessionId: s.id, runId, workerId, node: t.node, state: 'failed', note: message })
+                emit({ type: 'worker', sessionId: s.id, runId, workerId, node: t.node, state: signal.aborted ? 'stopped' : 'failed', note: signal.aborted ? undefined : message })
               }
             }
           }
-          await Promise.all(Array.from({ length: Math.min(maxParallel, tasks.length) }, worker))
+          await Promise.all(Array.from({ length: Math.min(maxParallel, tasks.length) }, run))
           return reports.join('\n\n')
         }
   }
 }
+
+/** Sent back when the agent wants to stop while its proposal still fails the checker. */
+const BROKEN = (sets: AgentChangeSet[]) =>
+  [
+    'Before you stop: these proposals still have checker errors. Go through all of them, then fix them together in one extend call per proposal (each error says how to fix it). If one cannot be fixed because the code really works that way, put the rule in the node ignore with the reason instead of guessing:',
+    ...sets.map((c) => `- ${c.id} (${c.title}):\n` + c.problems.filter((p) => p.level === 'error').map((p) => `  error [${p.rule}] ${p.where}: ${p.msg}`).join('\n')),
+    'Call propose_change_set with extend: <id> and the corrected files. Follow "画函数图（执行图）的规则" in the workflow for exec-entry / exec-dead-end / end-exit.'
+  ].join('\n')
+
+
+const SUB_AGENT = (node: string, scope: string) =>
+  [
+    `You are a sub-agent. Your only job: break down node ${node} into its own map, following "子 agent 做什么" in section E of the workflow. Sections A–D and review gates are the main agent's job, not yours.`,
+    `Put every file under ${scope}/. Work with tools right away: read the code and the templates, then propose the files with propose_change_set (one or two files per call) and fix the checker problems it reports.`,
+    'Do not stop to describe a plan or ask questions; nobody answers you. Finish only after your files are proposed, with a short report: what you drew, what is uncertain, what other modules or the parent map need to change.',
+    "Write in the language of the task you were given (the instructions below)."
+  ].join('\n')
 
 /** A sub-agent breaks one node down; it may only propose files inside that node's folder. */
 async function runSubAgent(
@@ -252,35 +406,43 @@ async function runSubAgent(
   node: string,
   instructions: string,
   runId: string,
+  workerId: string,
   emit: Emit,
   provider: Awaited<ReturnType<typeof resolveProvider>>['provider'],
   key: string,
   model: string,
-  signal: AbortSignal,
-  maxTurns = 1000
+  signal: AbortSignal
 ): Promise<string> {
   const lib = readLibrary(s.library, true)
   const entry = lib.model.nodes.get(node)
   const scope = entry ? path.dirname(entry.file) : node.split('.').join('/')
-  const env = makeEnv(s, access, runId, emit, 1, provider, key, model, signal, scope)
+  let proposed = 0
+  const mine = new Set<string>()
+  const env = makeEnv(s, access, runId, emit, 1, provider, key, model, signal, { scope, workerId, node, proposed: () => proposed++ }, (id) => mine.add(id))
   const defs = toolsFor('create', false).filter((d) => d.spec.name !== 'review_gate')
-  const system = await systemPrompt(s.library, 'create', { stack: [], selected: [node], flow: null }, `You are a sub-agent. Break down only node ${node}; put new files under ${scope}/. Finish with a short report: what you drew and what still needs checking.`)
+  const system = await systemPrompt(s.library, 'create', { stack: [], selected: [node], flow: null }, SUB_AGENT(node, scope))
   const history: Message[] = [{ role: 'user', content: [{ type: 'text', text: instructions }] }]
   let report = ''
-  for (let turn = 0; turn < maxTurns && !signal.aborted; turn++) {
-    const answer = await callModel(provider, key, { model, system, messages: history, tools: defs.map((d) => d.spec), signal })
-    emit({ type: 'usage', sessionId: s.id, runId, input: answer.usage.input, output: answer.usage.output })
-    history.push({ role: 'assistant', content: answer.blocks })
-    report = answer.blocks.filter((b) => b.type === 'text').map((b) => (b as { text: string }).text).join('\n') || report
-    const calls = answer.blocks.filter((b) => b.type === 'tool_use') as Array<Extract<Block, { type: 'tool_use' }>>
-    if (!calls.length) break
-    const results: Block[] = []
-    for (const call of calls) {
-      const result = await runTool(defs, env, call.name, call.input)
-      results.push({ type: 'tool_result', id: call.id, content: result.content, isError: !result.ok })
+  let nudges = 0
+  const reason = await turnLoop({ provider, key, model, system, signal }, history, defs, env, (input, output) => emit({ type: 'usage', sessionId: s.id, runId, input, output }), {
+    onText: (text) => {
+      report = text
+      emit({ type: 'worker-step', sessionId: s.id, runId, workerId, node, label: text.split('\n')[0].slice(0, 160), note: true })
+    },
+    onTool: (_name, label) => {
+      emit({ type: 'worker-step', sessionId: s.id, runId, workerId, node, label })
+      return (ok, summary) => emit({ type: 'worker-step', sessionId: s.id, runId, workerId, node, label, ok, summary })
+    },
+    // Ending with words only is not done: it has to propose its map first.
+    nudge: () => {
+      if (nudges++ >= 20) return null
+      if (!proposed) return 'You have not proposed any file yet. Do the work now with tools: read the code you need, then call propose_change_set with the map for this node (one or two files per call). Do not describe a plan.'
+      const broken = s.changeSets.filter((c) => c.status === 'proposed' && mine.has(c.id) && c.problems.some((p) => p.level === 'error'))
+      return broken.length ? BROKEN(broken) : null
     }
-    history.push({ role: 'user', content: results })
-  }
+  })
+  if (reason === 'stopped') return 'Stopped.'
+  if (!proposed) return (report || 'No report.') + '\n(This sub-agent proposed no files.)'
   return report || 'No report.'
 }
 

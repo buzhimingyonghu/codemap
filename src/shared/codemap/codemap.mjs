@@ -549,8 +549,11 @@ export function resolveCode(model, id, code = codeOf(model.nodes.get(id)?.node))
   let file = p.file
   if (!file) file = scopeAnchorFor(model, id)?.file ?? null
   const repoId = repoFor(model, id)
-  const entry = repoId ? model.nodes.get(repoId) : null
-  const repo = entry ? normRepo(codeRepoOf(entry.node)) : null
+  // 组件上的待核查：组件没有 fn.repo，代码在组件自己的 repo 里
+  const self = model.nodes.get(id)
+  const own = !repoId && self?.node?.kind !== 'function' && self?.node?.repo ? self : null
+  const entry = repoId ? model.nodes.get(repoId) : own
+  const repo = entry ? normRepo(repoId ? codeRepoOf(entry.node) : entry.node.repo) : null
   // repo.local 相对写 repo 的那个 yaml 所在的文件夹
   const local = repo?.local ? joinPath(dirOf(entry.file), repo.local) : null
   return { repoId, remote: repo?.remote ?? null, local, dir: '', file, lines: p.lines }
@@ -766,7 +769,8 @@ export function validate(model) {
         }
         unknownKeys(it, 'issue', iw)
         // code 的仓库取节点自己的 fn.repo；只写行号时，文件取节点自己的 fn.code
-        if (it.code !== undefined) checkCode(issueCode(model, id, it.code), id, iw, n, codeRepoOf(n) ?? (repoFor(model, id) ? {} : undefined))
+        // 组件、服务这类不是函数的节点没有 fn.repo，就用节点自己的 repo
+        if (it.code !== undefined) checkCode(issueCode(model, id, it.code), id, iw, n, codeRepoOf(n) ?? (n.kind !== 'function' ? n.repo : undefined) ?? (repoFor(model, id) ? {} : undefined))
       })
     }
     // 代码位置：函数在 fn.code + fn.repo，数据在 code + repo
@@ -1010,6 +1014,36 @@ export function validate(model) {
       }
       return null
     }
+    // 流程跳步时，找出从已经到过的节点走到 target 的最短连线路径（不含起点，含 target）
+    const shortOf = (id, map) => (id && id.startsWith(map + '.') ? id.slice(map.length + 1) : id)
+    const missingPath = (reached, target) => {
+      const next = new Map()
+      for (const e of nX.edges ?? []) {
+        const [a, b] = edgeEnds(X, e)
+        if (!a || !b) continue
+        if (!next.has(a)) next.set(a, [])
+        next.get(a).push(b)
+      }
+      const prev = new Map()
+      const queue = [...reached]
+      const seen = new Set(queue)
+      while (queue.length) {
+        const cur = queue.shift()
+        if (cur === target) break
+        for (const b of next.get(cur) ?? []) {
+          if (seen.has(b)) continue
+          seen.add(b)
+          prev.set(b, cur)
+          queue.push(b)
+        }
+      }
+      if (!prev.has(target)) return null
+      const path = []
+      for (let cur = target; cur && !reached.has(cur); cur = prev.get(cur)) path.unshift(cur)
+      const start = prev.get(path[0])
+      return start ? [start, ...path] : path
+    }
+
     for (const f of nX.flows ?? []) {
       const full = `${X}.${f.id}`
       const fw = `${file} 流程 ${full}`
@@ -1043,7 +1077,12 @@ export function validate(model) {
         }
         const hit = stepEdge(from, to)
         if (!hit) report('error', 'step-edge', sw, `${s.from} → ${s.to} 不在这张地图的任何一条连线上`, s)
-        if (!background && reached.size && !reached.has(from)) report('error', 'step-reached', sw, `小球还没到过 ${s.from}`, s)
+        if (!background && reached.size && !reached.has(from)) {
+          // 告诉写的人缺了哪几步：从已经到过的节点沿连线走到 from 的最短路径
+          const gap = missingPath(reached, from)
+          const tip = gap ? `，中间少了 ${gap.map((id) => shortOf(id, X)).join(' → ')}，把这几步补进流程` : `，前面的步骤要先走到 ${s.from}`
+          report('error', 'step-reached', sw, `小球还没到过 ${s.from}${tip}`, s)
+        }
         reached.add(from)
         reached.add(to)
         if (memSet.has(from) !== memSet.has(to)) crossing.push([from, to])
@@ -1224,16 +1263,21 @@ export function validate(model) {
       const where = `${W} 节点 ${id}`
       const out = outs.get(id) ?? []
       const ex = exits.get(id) ?? []
-      if (!seen.has(id)) report('error', 'exec-reachable', where, '从入口走不到这个节点', n)
-      if (r === 'entry' && ins.get(id)?.length) report('error', 'exec-entry', where, '入口（写了 trigger / serves）不应该有图内的入边', n)
+      if (!seen.has(id)) report('error', 'exec-reachable', where, '从入口走不到这个节点：补一条从入口那一侧连过来的线；它是被图外调起的，就给它写 fn.trigger', n)
+      if (r === 'entry' && ins.get(id)?.length) {
+        const by = ins.get(id).map((x) => shortOf(x.from, X)).join('、')
+        report('error', 'exec-entry', where, `入口（写了 trigger / serves）不应该有图内的入边：它是被 ${by} 调起的，去掉它的 trigger / serves，当普通步骤`, n)
+      }
       // 入口在上层地图里只是一个“门”：只连外部节点、自己有 contains（下一层展开），
       // 或者这张图里只有入口（自上而下梳理时，先把入口归到模块，内部步骤以后再补），都不算死路
       const door = r === 'entry' && (ex.length || n.contains || onlyEntries)
       // 普通步骤只调用外部（比如提交位点到云 API）也算有出口
       const callsOut = r === 'step' && ex.some(({ e }) => e.kind === 'call' || e.kind === 'send')
-      if (r !== 'end' && !out.length && !door && !callsOut) report('error', 'exec-dead-end', where, '分支无出口：节点没有往下走的连线', n)
+      // 常驻循环（监听 / 定时）自己一直转，不往下走也不算死路，比如定时采负载只更新内存
+      const resident = f.type === 'listen' || f.type === 'timer'
+      if (r !== 'end' && !out.length && !door && !callsOut && !resident) report('error', 'exec-dead-end', where, '分支无出口：节点没有往下走的连线。走到这里就完了的写 fn.outcome（再连到外部或写 fn.terminal: true）；还要往下走的补上连线', n)
       if (r === 'end') {
-        if (out.length) report('error', 'end-exit', where, '结束（写了 outcome）不应该再连到图内其他节点', n)
+        if (out.length) report('error', 'end-exit', where, `结束（写了 outcome）不应该再连到图内其他节点：它还连到 ${out.map((x) => shortOf(x.to, X)).join('、')}，去掉 outcome 当普通步骤，或者去掉这些线`, n)
         if (!ex.length && !f.terminal) report('error', 'end-exit', where, '结束后交给谁不明确：要有一条连到外部的线，或者写 fn.terminal: true', n)
         for (const { e } of ex) {
           if (f.outcome === 'error' && !e.error && e.kind !== 'return') report('warn', 'end-exit', where, `错误结束，但出口 ${e.from}->${e.to} 不是错误边`, n)

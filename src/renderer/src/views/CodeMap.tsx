@@ -118,7 +118,7 @@ import {
 import { getState, setState, useStore } from '../state/store'
 import { EditorArea } from '../workbench/EditorArea'
 import { AgentTab } from './AgentTab'
-import { getAgent, onAgentLit } from '../services/agent'
+import { agentMarks, onAgentLit } from '../services/agent'
 
 type Detail =
   | { kind: 'node'; id: string }
@@ -490,8 +490,8 @@ function CodeMapStage({ data, frozen }: { data: CodeMapData; frozen: boolean }) 
   useEffect(() => () => stop(), [stop])
   // The assistant lights up the nodes it is looking at; re-applied after every render of the map.
   useEffect(() => {
-    engineRef.current?.agentMark(getAgent().lit)
-    return onAgentLit((ids) => engineRef.current?.agentMark(ids))
+    engineRef.current?.agentMark(agentMarks())
+    return onAgentLit((marks) => engineRef.current?.agentMark(marks))
   }, [sceneKey])
 
   // ---------- Navigation ----------

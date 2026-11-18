@@ -91,6 +91,15 @@ export function defaultProviders(): AgentProvider[] {
 
 const TIMEOUT_MS = 10 * 60 * 1000
 
+export class ModelHttpError extends Error {
+  constructor(
+    readonly status: number,
+    readonly body: string
+  ) {
+    super(`Model request failed (${status}): ${body.slice(0, 400)}`)
+  }
+}
+
 async function post(url: string, headers: Record<string, string>, body: unknown, signal?: AbortSignal): Promise<any> {
   const timeout = AbortSignal.timeout(TIMEOUT_MS)
   const response = await fetch(url, {
@@ -100,7 +109,7 @@ async function post(url: string, headers: Record<string, string>, body: unknown,
     signal: signal ? AbortSignal.any([signal, timeout]) : timeout
   })
   const text = await response.text()
-  if (!response.ok) throw new Error(`Model request failed (${response.status}): ${text.slice(0, 400)}`)
+  if (!response.ok) throw new ModelHttpError(response.status, text)
   try {
     return JSON.parse(text)
   } catch {
@@ -129,7 +138,7 @@ async function callAnthropic(p: AgentProvider, key: string, req: ModelRequest): 
     { 'x-api-key': key, authorization: `Bearer ${key}`, 'anthropic-version': '2023-06-01' },
     {
       model: req.model,
-      max_tokens: req.maxTokens ?? 8192,
+      max_tokens: req.maxTokens ?? OUTPUT_TOKENS[0],
       system: req.system,
       messages,
       tools: req.tools.map((t) => ({ name: t.name, description: t.description, input_schema: t.schema }))
@@ -170,7 +179,7 @@ async function callOpenAI(p: AgentProvider, key: string, req: ModelRequest): Pro
     {
       model: req.model,
       stream: false,
-      max_tokens: req.maxTokens ?? 8192,
+      max_tokens: req.maxTokens ?? OUTPUT_TOKENS[0],
       messages,
       tools: req.tools.map((t) => ({ type: 'function', function: { name: t.name, description: t.description, parameters: t.schema } }))
     },
@@ -194,8 +203,68 @@ async function callOpenAI(p: AgentProvider, key: string, req: ModelRequest): Pro
   return { blocks, stop, usage: { input: data.usage?.prompt_tokens ?? 0, output: data.usage?.completion_tokens ?? 0 } }
 }
 
+// Output budget per reply: as large as the model allows. A map build writes whole YAML files
+// in one tool call, so a small budget cuts the call off. Gateways reject a budget above the
+// model's limit with a 400; we then step down and remember what worked for that model.
+const OUTPUT_TOKENS = [128000, 64000, 32000, 16000, 8192]
+const outputBudget = new Map<string, number>()
+
+function budgetError(error: unknown): boolean {
+  return error instanceof ModelHttpError && error.status === 400 && /max_tokens|max_completion_tokens|maximum|too large|exceed|output/i.test(error.body)
+}
+
+// Network hiccups (fetch failed, a gateway 5xx / 429, a dropped connection) are retried with a
+// growing wait instead of ending the run.
+function transient(error: unknown): boolean {
+  if (error instanceof ModelHttpError) return error.status === 429 || error.status >= 500
+  const msg = error instanceof Error ? `${error.message} ${String((error as { cause?: unknown }).cause ?? '')}` : String(error)
+  return /fetch failed|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|socket hang up|network|terminated|other side closed/i.test(msg)
+}
+
+/** Waits, but gives up as soon as the run is stopped. */
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) return reject(signal.reason)
+    const timer = setTimeout(done, ms)
+    function done() {
+      signal?.removeEventListener('abort', abort)
+      resolve()
+    }
+    function abort() {
+      clearTimeout(timer)
+      reject(signal?.reason)
+    }
+    signal?.addEventListener('abort', abort, { once: true })
+  })
+}
+
+async function withRetry<T>(fn: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+  const waits = [2000, 5000, 10000, 20000, 30000]
+  for (let i = 0; ; i++) {
+    try {
+      return await fn()
+    } catch (error) {
+      if (signal?.aborted || i >= waits.length || !transient(error)) throw error
+      await sleep(waits[i], signal)
+    }
+  }
+}
+
 export async function callModel(p: AgentProvider, key: string, req: ModelRequest): Promise<ModelReply> {
-  return p.kind === 'anthropic' ? callAnthropic(p, key, req) : callOpenAI(p, key, req)
+  const call = (r: ModelRequest) => withRetry(() => (p.kind === 'anthropic' ? callAnthropic(p, key, r) : callOpenAI(p, key, r)), r.signal)
+  if (req.maxTokens) return call(req)
+  const id = `${p.id}/${req.model}`
+  const known = outputBudget.get(id)
+  const tries = known ? OUTPUT_TOKENS.filter((n) => n <= known) : OUTPUT_TOKENS
+  for (let i = 0; ; i++) {
+    try {
+      const reply = await call({ ...req, maxTokens: tries[i] })
+      outputBudget.set(id, tries[i])
+      return reply
+    } catch (error) {
+      if (i + 1 >= tries.length || !budgetError(error)) throw error
+    }
+  }
 }
 
 /** Model ids the provider lists (GET {base}/v1/models or {base}/models). */
