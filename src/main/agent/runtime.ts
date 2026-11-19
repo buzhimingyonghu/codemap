@@ -3,7 +3,7 @@ import { mkdir, readdir, readFile, rename, rm, writeFile } from 'node:fs/promise
 import path from 'node:path'
 import yaml from 'js-yaml'
 import { stringify as toYaml } from 'yaml'
-import type { AgentChangeSet, AgentContext, AgentEndReason, AgentEvent, AgentMessageView, AgentPhase, AgentSessionInfo, AgentSessionSummary, AgentStartRequest } from '../../shared/agent'
+import type { AgentChangeSet, AgentContext, AgentEndReason, AgentEvent, AgentMessageView, AgentPhase, AgentSessionInfo, AgentSessionSummary, AgentStartRequest, AgentUsageSummary } from '../../shared/agent'
 import { isInside } from '../../shared/paths'
 import type { CodemapAccess } from '../codemap/service'
 import { callModel, type Block, type Message } from './providers'
@@ -20,10 +20,30 @@ interface Session extends AgentSessionInfo {
   library: string
   /** Full conversation sent to the model. */
   history: Message[]
+  usage: AgentUsageSummary
+}
+
+interface LiveRun {
+  emit: Emit
+  /** Proposal ids made by the main run, so a discarded draft leaves the broken-proposal nudge. */
+  runSets: Set<string>
+  /** Each sub-agent's own proposal ids. */
+  mines: Set<Set<string>>
 }
 
 const sessions = new Map<string, Session>()
+
 const running = new Map<string, AbortController>()
+const liveRuns = new Map<string, LiveRun>()
+
+function emptyUsage(): AgentUsageSummary {
+  return { contextTokens: 0, totalInput: 0, totalOutput: 0, workerInput: 0, workerOutput: 0 }
+}
+
+function ensureUsage(s: Session): AgentUsageSummary {
+  if (!s.usage) s.usage = emptyUsage()
+  return s.usage
+}
 /** One write at a time per session, so parallel sub-agents cannot interleave the JSON. */
 const persistQueues = new Map<string, Promise<void>>()
 
@@ -78,6 +98,7 @@ async function loadSession(library: string, id: string): Promise<Session> {
   await ensureElectronHost()
   const s = JSON.parse(await readFile(path.join(sessionsDir(library), `${id}.json`), 'utf8')) as Session
   if (s.library !== library) throw new Error('This conversation belongs to another node library')
+  ensureUsage(s)
   sessions.set(id, s)
   return s
 }
@@ -126,12 +147,20 @@ export async function startRun(library: string, access: CodemapAccess, req: Agen
       return s.id
     }
   } else {
-    s = { id: randomUUID(), library, mode: req.mode, title: makeTitle(req.message), updatedAt: Date.now(), messages: [], changeSets: [], history: [], gate: null }
+    s = { id: randomUUID(), library, mode: req.mode, title: makeTitle(req.message), updatedAt: Date.now(), messages: [], changeSets: [], history: [], gate: null, usage: emptyUsage() }
     sessions.set(s.id, s)
   }
   s.gate = null
   // Build map: the repositories and knowledge are kept with the conversation.
-  if (s.mode === 'create' && req.context.repos) s.sources = { repos: req.context.repos, docs: req.context.docs ?? [], output: req.context.output ?? '' }
+  if (s.mode === 'create' && (req.context.repos || req.context.buildTier || req.context.buildLens || req.context.docs || req.context.output)) {
+    s.sources = {
+      repos: req.context.repos ?? s.sources?.repos ?? [],
+      docs: req.context.docs ?? s.sources?.docs ?? [],
+      output: req.context.output ?? s.sources?.output ?? '',
+      buildTier: req.context.buildTier ?? s.sources?.buildTier,
+      buildLens: req.context.buildLens ?? s.sources?.buildLens
+    }
+  }
   s.messages.push({ role: 'user', text: req.message, at: Date.now() })
   s.history.push({ role: 'user', content: [{ type: 'text', text: req.message }] })
   s.updatedAt = Date.now()
@@ -141,8 +170,11 @@ export async function startRun(library: string, access: CodemapAccess, req: Agen
   const runId = randomUUID()
   const controller = new AbortController()
   running.set(s.id, controller)
-  void runLoop(s, access, req, runId, controller, emit, extra?.lsp).finally(() => {
+  const live: LiveRun = { emit, runSets: new Set<string>(), mines: new Set() }
+  liveRuns.set(s.id, live)
+  void runLoop(s, access, req, runId, controller, emit, live, extra?.lsp).finally(() => {
     running.delete(s.id)
+    if (liveRuns.get(s.id) === live) liveRuns.delete(s.id)
     inbox.delete(s.id)
     void persist(s)
   })
@@ -263,7 +295,7 @@ async function turnLoop(
   }
 }
 
-async function runLoop(s: Session, access: CodemapAccess, req: AgentStartRequest, runId: string, controller: AbortController, emit: Emit, lsp?: ToolEnv['lsp']): Promise<void> {
+async function runLoop(s: Session, access: CodemapAccess, req: AgentStartRequest, runId: string, controller: AbortController, emit: Emit, live: LiveRun, lsp?: ToolEnv['lsp']): Promise<void> {
   const settings = await rawAgentSettings()
   const reply: AgentMessageView = { role: 'assistant', text: '', steps: [], at: Date.now() }
   s.messages.push(reply)
@@ -273,12 +305,17 @@ async function runLoop(s: Session, access: CodemapAccess, req: AgentStartRequest
     const settingsModel = !req.providerId || req.providerId === settings.activeProvider ? settings.modeModels[s.mode] : undefined
     const model = req.model || settingsModel || provider.model
     if (!model) throw new Error(`No model chosen for ${provider.name}: pick one in Settings → AI`)
-    const runSets = new Set<string>()
     let fixNudges = 0
-    const env = makeEnv(s, access, runId, emit, settings.maxParallel, provider, key, model, controller.signal, undefined, (id) => runSets.add(id), lsp)
+    const env = makeEnv(s, access, runId, emit, settings.maxParallel, provider, key, model, controller.signal, undefined, (id) => live.runSets.add(id), lsp, live)
     const defs = toolsFor(s.mode, true, { lsp: Boolean(lsp) })
     const system = await systemPrompt(s.library, s.mode, withSources(s, req.context))
-    reason = await turnLoop({ provider, key, model, system, signal: controller.signal }, s.history, defs, env, (input, output) => emit({ type: 'usage', sessionId: s.id, runId, input, output }), {
+    reason = await turnLoop({ provider, key, model, system, signal: controller.signal }, s.history, defs, env, (input, output) => {
+      const usage = ensureUsage(s)
+      usage.contextTokens = input
+      usage.totalInput += input
+      usage.totalOutput += output
+      emit({ type: 'usage', sessionId: s.id, runId, input, output, contextTokens: input, isWorker: false })
+    }, {
       onText: (text, append) => {
         const sep = reply.text && !append ? '\n\n' : ''
         reply.text += sep + text
@@ -299,7 +336,7 @@ async function runLoop(s: Session, access: CodemapAccess, req: AgentStartRequest
       halt: () => Boolean(s.gate),
       // Its own proposals from this run that still fail the checker: send it back to fix them.
       nudge: () => {
-        const broken = s.changeSets.filter((c) => c.status === 'proposed' && runSets.has(c.id) && c.problems.some((p) => p.level === 'error'))
+        const broken = s.changeSets.filter((c) => c.status === 'proposed' && live.runSets.has(c.id) && c.problems.some((p) => p.level === 'error'))
         if (!broken.length || fixNudges++ >= 20) return null
         return BROKEN(broken)
       },
@@ -336,7 +373,14 @@ async function runLoop(s: Session, access: CodemapAccess, req: AgentStartRequest
 /** Build map: a continued conversation keeps working from the sources saved with it. */
 function withSources(s: Session, context: AgentContext): AgentContext {
   if (s.mode !== 'create' || !s.sources) return context
-  return { ...context, repos: s.sources.repos, docs: s.sources.docs, output: s.sources.output }
+  return {
+    ...context,
+    repos: context.repos ?? s.sources.repos,
+    docs: context.docs ?? s.sources.docs,
+    output: context.output ?? s.sources.output,
+    buildTier: context.buildTier ?? s.sources.buildTier,
+    buildLens: context.buildLens ?? s.sources.buildLens
+  }
 }
 
 function takeInbox(id: string): string[] {
@@ -356,7 +400,9 @@ function makeEnv(
   signal: AbortSignal,
   worker?: { scope: string; workerId: string; node: string; proposed: () => void },
   onProposed?: (id: string) => void,
-  lsp?: ToolEnv['lsp']
+  lsp?: ToolEnv['lsp'],
+  live?: LiveRun,
+  mine?: Set<string>
 ): ToolEnv {
   const scope = worker?.scope
   return {
@@ -369,7 +415,7 @@ function makeEnv(
       if (worker) emit({ type: 'worker-step', sessionId: s.id, runId, workerId: worker.workerId, node: worker.node, label: note ?? '', lit: nodes, note: true })
       else emit({ type: 'focus', sessionId: s.id, runId, map, nodes, flow, note })
     },
-    propose: (input, extend) => {
+    propose: (input, extend, replaceChanges) => {
       if (scope) {
         for (const rel of Object.keys(input.files)) {
           if (!isInside(path.join(s.library, scope), path.join(s.library, rel))) throw new Error(`Sub-agent for ${scope} may only write files under ${scope}/: ${rel}`)
@@ -382,7 +428,8 @@ function makeEnv(
         if (!old) throw new Error(`No proposal ${extend} in this conversation`)
         if (old.status === 'applied') throw new Error(`Proposal ${extend} is already applied; make a new proposal for further changes`)
         const files = { ...old.files, ...input.files }
-        const changes = [...old.changes, ...input.changes]
+        // replaceChanges drops the earlier changes[] list. Rejected drafts keep the old list only when appending.
+        const changes = replaceChanges ? [...input.changes] : [...old.changes, ...input.changes]
         // The card shows the latest description, not every revision appended.
         const summary = input.summary || old.summary
         if (old.status === 'rejected') {
@@ -402,6 +449,11 @@ function makeEnv(
       onProposed?.(set.id)
       return set
     },
+    discard: async (id) => {
+      if (worker && !mine?.has(id)) throw new Error('Sub-agent may only discard its own proposals')
+      const title = await discardChangeSet(s.library, s.id, id, emit)
+      return { id, title }
+    },
     gate: (stage, summary) => {
       // The user reviews the architecture and the logic, never checker errors: those are fixed first.
       const broken = s.changeSets.filter((c) => c.status === 'proposed' && c.problems.some((p) => p.level === 'error'))
@@ -420,7 +472,7 @@ function makeEnv(
               const workerId = randomUUID().slice(0, 6)
               emit({ type: 'worker', sessionId: s.id, runId, workerId, node: t.node, state: 'running' })
               try {
-                const report = await runSubAgent(s, access, t.node, t.instructions, runId, workerId, emit, provider, key, model, signal, lsp)
+                const report = await runSubAgent(s, access, t.node, t.instructions, runId, workerId, emit, provider, key, model, signal, lsp, live)
                 reports.push(`## ${t.node}\n${report}`)
                 emit({ type: 'worker', sessionId: s.id, runId, workerId, node: t.node, state: signal.aborted ? 'stopped' : 'done' })
               } catch (error) {
@@ -441,7 +493,7 @@ const BROKEN = (sets: AgentChangeSet[]) =>
   [
     'Before you stop: these proposals still have checker errors. Go through all of them, then fix them together in one extend call per proposal (each error says how to fix it). If one cannot be fixed because the code really works that way, put the rule in the node ignore with the reason instead of guessing:',
     ...sets.map((c) => `- ${c.id} (${c.title}):\n` + c.problems.filter((p) => p.level === 'error').map((p) => `  error [${p.rule}] ${p.where}: ${p.msg}`).join('\n')),
-    'Call propose_change_set with extend: <id> and the corrected files. Follow "画函数图（执行图）的规则" in the workflow for exec-entry / exec-dead-end / end-exit.'
+    'Call propose_change_set with extend: <id> and the corrected files. If earlier changes entries in <id> are contradictory or broken, pass replaceChanges: true so they are replaced instead of appended. If the draft cannot be fixed, call discard_change_set({ id: "<id>", reason: "..." }) and then propose a clean one. Say which #id and title was discarded and why. Follow "画函数图（执行图）的规则" in the workflow for exec-entry / exec-dead-end / end-exit.'
   ].join('\n')
 
 
@@ -466,20 +518,27 @@ async function runSubAgent(
   key: string,
   model: string,
   signal: AbortSignal,
-  lsp?: ToolEnv['lsp']
+  lsp?: ToolEnv['lsp'],
+  live?: LiveRun
 ): Promise<string> {
   const lib = readLibrary(s.library, true)
   const entry = lib.model.nodes.get(node)
   const scope = entry ? path.dirname(entry.file) : node.split('.').join('/')
   let proposed = 0
   const mine = new Set<string>()
-  const env = makeEnv(s, access, runId, emit, 1, provider, key, model, signal, { scope, workerId, node, proposed: () => proposed++ }, (id) => mine.add(id), lsp)
+  live?.mines.add(mine)
+  const env = makeEnv(s, access, runId, emit, 1, provider, key, model, signal, { scope, workerId, node, proposed: () => proposed++ }, (id) => mine.add(id), lsp, live, mine)
   const defs = toolsFor('create', false, { lsp: Boolean(lsp) }).filter((d) => d.spec.name !== 'review_gate')
-  const system = await systemPrompt(s.library, 'create', { stack: [], selected: [node], flow: null }, SUB_AGENT(node, scope))
+  const system = await systemPrompt(s.library, 'create', withSources(s, { stack: [], selected: [node], flow: null }), SUB_AGENT(node, scope))
   const history: Message[] = [{ role: 'user', content: [{ type: 'text', text: instructions }] }]
   let report = ''
   let nudges = 0
-  const reason = await turnLoop({ provider, key, model, system, signal }, history, defs, env, (input, output) => emit({ type: 'usage', sessionId: s.id, runId, input, output }), {
+  const reason = await turnLoop({ provider, key, model, system, signal }, history, defs, env, (input, output) => {
+    const usage = ensureUsage(s)
+    usage.workerInput = (usage.workerInput ?? 0) + input
+    usage.workerOutput = (usage.workerOutput ?? 0) + output
+    emit({ type: 'usage', sessionId: s.id, runId, input, output, contextTokens: usage.contextTokens, isWorker: true })
+  }, {
     onText: () => undefined,
     onTurnText: (text) => {
       report = text
@@ -502,6 +561,7 @@ async function runSubAgent(
       void persist(s)
     }
   })
+  live?.mines.delete(mine)
   if (reason === 'stopped') return 'Stopped.'
   if (!proposed) return (report || 'No report.') + '\n(This sub-agent proposed no files.)'
   return report || 'No report.'
@@ -527,7 +587,8 @@ export function compactHistory(history: Message[]): Message[] {
     const content = message.content.map((block) => {
       if (block.type !== 'tool_result' || block.content.length <= COMPACT_TOOL) return block
       changed = true
-      return { ...block, content: block.content.slice(0, 600) + '\n... [earlier tool output compacted; call read tool again if needed]' }
+      const limit = block.content.startsWith('[PINNED_REPO_SCAN]') ? 8000 : 600
+      return { ...block, content: block.content.slice(0, limit) + '\n... [earlier tool output compacted; call the tool again if needed]' }
     })
     return changed ? { ...message, content } : message
   })
@@ -546,6 +607,86 @@ function sanitizeProposalFiles(files: Record<string, string> | undefined): Recor
   return clean
 }
 
+/** Removes an unapplied draft. Library YAML is never touched. The in-memory list changes only after the session file is replaced. */
+export async function discardChangeSet(library: string, sessionId: string, setId: string, emit?: Emit): Promise<string> {
+  const s = await loadSession(library, sessionId)
+  return discardLoaded(s, setId, emit)
+}
+
+async function discardLoaded(s: Session, setId: string, emit?: Emit): Promise<string> {
+  const target = s.changeSets.find((c) => c.id === setId)
+  if (!target) throw new Error(`No proposal ${setId} in this conversation`)
+  if (target.status === 'applied') throw new Error(`Proposal ${setId} is already applied and cannot be discarded`)
+  const nextChangeSets = s.changeSets
+    .filter((c) => c.id !== setId)
+    .map((c) => {
+      const copy: AgentChangeSet = { ...c, replaces: c.replaces === setId ? undefined : c.replaces }
+      if (copy.status !== 'proposed') return copy
+      const peers = nextPeers(s.changeSets, setId, copy.id)
+      return { ...copy, problems: checkChangeSet(s.library, { changes: copy.changes, files: copy.files }, peers) }
+    })
+  const snapshot: Session = { ...s, changeSets: nextChangeSets, updatedAt: Date.now() }
+  await writeThroughQueue(s.id, snapshot)
+  s.changeSets = nextChangeSets
+  s.updatedAt = snapshot.updatedAt
+  const live = liveRuns.get(s.id)
+  live?.runSets.delete(setId)
+  for (const mine of live?.mines ?? []) mine.delete(setId)
+  const event: AgentEvent = { type: 'changeset-discarded', sessionId: s.id, changeSetId: setId }
+  emit?.(event)
+  if (emit !== live?.emit) live?.emit(event)
+  return target.title
+}
+
+function nextPeers(sets: AgentChangeSet[], droppedId: string, exceptId: string): Array<Pick<AgentChangeSet, 'changes' | 'files'>> {
+  return sets
+    .filter((set) => set.id !== droppedId && set.id !== exceptId && set.status === 'proposed')
+    .map((set) => ({ changes: set.changes, files: set.files }))
+}
+
+async function writeThroughQueue(id: string, snapshot: Session): Promise<void> {
+  const previous = persistQueues.get(id) ?? Promise.resolve()
+  const write = previous.catch(() => undefined).then(() => writeSession(snapshot))
+  const settled = write.then(
+    () => undefined,
+    () => undefined
+  )
+  persistQueues.set(id, settled)
+  try {
+    await write
+  } finally {
+    if (persistQueues.get(id) === settled) persistQueues.delete(id)
+  }
+}
+
+async function findProposal(library: string, setId: string): Promise<{ session: Session; target: AgentChangeSet } | null> {
+  for (const session of sessions.values()) {
+    if (session.library !== library) continue
+    const target = session.changeSets.find((c) => c.id === setId)
+    if (target) return { session, target }
+  }
+  await ensureElectronHost()
+  for (const name of await readdir(sessionsDir(library)).catch(() => [] as string[])) {
+    if (!name.endsWith('.json')) continue
+    try {
+      const session = await loadSession(library, name.slice(0, -'.json'.length))
+      const target = session.changeSets.find((c) => c.id === setId)
+      if (target) return { session, target }
+    } catch {
+      // skip a broken file
+    }
+  }
+  return null
+}
+
+/** Drops an external or in-chat draft by id, searching loaded and saved sessions of this library. */
+export async function discardExternalProposal(library: string, setId: string, emit?: Emit): Promise<{ sessionId: string; title: string }> {
+  const found = await findProposal(library, setId)
+  if (!found) throw new Error(`No proposal ${setId} in this conversation`)
+  const title = await discardChangeSet(library, found.session.id, setId, emit)
+  return { sessionId: found.session.id, title }
+}
+
 /**
  * Registers a proposal made outside the chat (an MCP tool, for example) in its own session,
  * so the user can Apply or Reject it from the panel.
@@ -553,11 +694,31 @@ function sanitizeProposalFiles(files: Record<string, string> | undefined): Recor
 export async function injectExternalProposal(
   library: string,
   proposal: Omit<AgentChangeSet, 'id' | 'sessionId' | 'problems' | 'status'>,
-  emit?: (event: AgentEvent) => void
+  emit?: (event: AgentEvent) => void,
+  options?: { extend?: string; replaceChanges?: boolean }
 ): Promise<{ sessionId: string; changeSet: AgentChangeSet }> {
   await ensureElectronHost()
   const cleanFiles = sanitizeProposalFiles(proposal.files)
   const normalizedProposal = { ...proposal, files: cleanFiles }
+  if (options?.extend) {
+    const found = await findProposal(library, options.extend)
+    if (found && found.target.status !== 'applied') {
+      const session = found.session
+      const old = found.target
+      const files = { ...old.files, ...cleanFiles }
+      const changes = options.replaceChanges ? [...(proposal.changes ?? [])] : [...old.changes, ...(proposal.changes ?? [])]
+      const summary = proposal.summary || old.summary
+      const next = { files, changes }
+      const problems = checkChangeSet(library, next, peerProposals(session, old.id))
+      Object.assign(old, { title: proposal.title || old.title, summary, files, changes, problems, requirement: proposal.requirement ?? old.requirement })
+      session.updatedAt = Date.now()
+      await persist(session)
+      const event: AgentEvent = { type: 'changeset', sessionId: session.id, runId: 'external', changeSet: old }
+      emit?.(event)
+      liveRuns.get(session.id)?.emit(event)
+      return { sessionId: session.id, changeSet: old }
+    }
+  }
   const session: Session = {
     id: randomUUID(),
     library,
@@ -567,7 +728,8 @@ export async function injectExternalProposal(
     messages: [],
     changeSets: [],
     history: [],
-    gate: null
+    gate: null,
+    usage: emptyUsage()
   }
   const changeSet: AgentChangeSet = {
     ...normalizedProposal,

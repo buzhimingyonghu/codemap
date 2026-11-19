@@ -7,6 +7,7 @@ import { isInside } from '../../shared/paths'
 import { loadLibrary } from '../codemap/loadLibrary.mjs'
 import type { CodemapAccess } from '../codemap/service'
 import { knowledgeRoot } from './knowledge'
+import { scanRepoEntrypoints } from './repoScanner'
 import type { ToolSpec } from './providers'
 
 // The agent's tools. Everything is read-only except propose_change_set, which only records a
@@ -24,8 +25,10 @@ export interface ToolEnv {
   }
   /** Lets the map follow the agent (focus a node, open a map, select a flow). */
   focus(map: string | null, nodes: string[], flow?: string | null, note?: string): void
-  /** New proposal, or with extend: add files and changes to a proposal not yet applied (checked as a whole). */
-  propose(set: Omit<AgentChangeSet, 'id' | 'sessionId' | 'problems' | 'status'>, extend?: string): AgentChangeSet
+  /** New proposal, or with extend: add files and changes to a proposal not yet applied (checked as a whole). replaceChanges drops the earlier changes[]. */
+  propose(set: Omit<AgentChangeSet, 'id' | 'sessionId' | 'problems' | 'status'>, extend?: string, replaceChanges?: boolean): AgentChangeSet
+  /** Drops an unapplied draft. Library YAML is not touched. */
+  discard(id: string, reason?: string): Promise<{ id: string; title: string }>
   /** Create mode: stop at a review gate. */
   gate(stage: string, summary: string): void
   /** Create mode: run sub-agents for several nodes at once (resolves when all finished). */
@@ -513,6 +516,7 @@ const TOOLS: ToolDef[] = [
           changes: { type: 'array', items: { type: 'object' } },
           files: { type: 'object', additionalProperties: { type: 'string' } },
           extend: { type: 'string', description: 'Id of an earlier proposal (not applied yet) to add these files and changes to' },
+          replaceChanges: { type: 'boolean', description: 'When used with extend, replaces the earlier changes[] list instead of appending to it.' },
           requirement: { type: 'object', properties: { id: { type: 'string' }, name: { type: 'string' }, desc: { type: 'string' } } }
         },
         required: ['title', 'summary']
@@ -533,13 +537,56 @@ const TOOLS: ToolDef[] = [
         changes: Array.isArray(i.changes) ? i.changes : [],
         files,
         requirement: env.mode === 'require' && i.requirement ? { id: str(i.requirement.id) || 'requirement', name: str(i.requirement.name) || str(i.title), desc: str(i.requirement.desc) || undefined } : undefined
-      }, i.extend ? str(i.extend) : undefined)
+      }, i.extend ? str(i.extend) : undefined, Boolean(i.replaceChanges))
       const errors = set.problems.filter((p) => p.level === 'error')
       const head = `Proposal ${set.id} (${Object.keys(set.files).length} files, ${set.changes.length} changes) recorded as a draft; the user sees it only when you finish.`
       const text = set.problems.length
         ? `${head}\nChecker problems so far:\n${set.problems.map((p) => `${p.level} [${p.rule}] ${p.where}: ${p.msg}`).join('\n')}\nIf you are still writing this map, keep going and add the rest with extend: \"${set.id}\". Once everything is written, fix all of these together in one extend call (each error says how), not one by one.`
         : `${head} The checker found no problems.`
       return { ok: true, content: clip(text), summary: errors.length ? `${errors.length} errors` : 'no new problems' }
+    }
+  },
+  {
+    spec: {
+      name: 'scan_repo_entrypoints',
+      description: 'Walks a repository and returns every sync entrypoint (HTTP/RPC/IPC/CLI), async consumer, timer, storage client, and git remote. Prefer this over search_code when building a map so entrypoints are not capped at 80 hits.',
+      schema: {
+        type: 'object',
+        properties: {
+          path: { type: 'string', description: 'Repository folder path to scan for all sync/async entrypoints, timers, storage, and git remote metadata' },
+          targetFolder: { type: 'string', description: 'Optional node folder inside the library (e.g. "order-svc") to compute exact repo.local relative path' }
+        },
+        required: ['path']
+      }
+    },
+    modes: 'all',
+    label: (i) => `Scan entrypoints ${path.basename(str(i.path)) || str(i.path)}`,
+    run: async (env, i) => {
+      const dir = path.isAbsolute(str(i.path)) ? str(i.path) : path.resolve(env.library, str(i.path))
+      if (!env.access.allowed(dir) && !isInside(env.library, dir)) throw new Error(`Not allowed to scan ${dir}`)
+      const report = await scanRepoEntrypoints(dir, env.library, i.targetFolder ? str(i.targetFolder) : undefined)
+      return ok(report, 'repo entrypoints')
+    }
+  },
+  {
+    spec: {
+      name: 'discard_change_set',
+      description: 'Discards an unapplied draft proposal. Library YAML files are not modified. Use this when a draft cannot be fixed, then propose a clean one and say which #id and title was discarded.',
+      schema: {
+        type: 'object',
+        properties: {
+          id: { type: 'string', description: 'Proposal id to discard (must not be applied yet)' },
+          reason: { type: 'string', description: 'Why this draft is being discarded' }
+        },
+        required: ['id']
+      }
+    },
+    modes: ['adjust', 'create', 'require'],
+    label: (i) => `Discard proposal #${i.id}`,
+    run: async (env, i) => {
+      const dropped = await env.discard(str(i.id), i.reason ? str(i.reason) : undefined)
+      const why = i.reason ? ` Reason: ${str(i.reason)}` : ''
+      return ok(`Discarded proposal #${dropped.id} (${dropped.title}). Library YAML files were untouched.${why}`, `#${dropped.id} ${dropped.title}`)
     }
   },
   {

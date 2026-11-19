@@ -150,6 +150,7 @@ const api: CodemapApi = {
     deleteSession: (id) => invoke('agent:deleteSession', id),
     applyChangeSet: (sessionId, changeSetId) => invoke('agent:applyChangeSet', sessionId, changeSetId),
     rejectChangeSet: (sessionId, changeSetId) => invoke('agent:rejectChangeSet', sessionId, changeSetId),
+    discardChangeSet: (sessionId, changeSetId) => invoke('agent:discardChangeSet', sessionId, changeSetId),
     knowledgeDir: () => invoke('agent:knowledgeDir'),
     pickRepos: () => invoke('agent:pickRepos'),
     pickDocs: () => invoke('agent:pickDocs'),

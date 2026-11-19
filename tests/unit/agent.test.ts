@@ -33,7 +33,8 @@ const env = (library: string, mode: 'ask' | 'adjust' = 'ask') => {
         proposals.push(set)
         return set as never
       },
-      gate: () => undefined
+      gate: () => undefined,
+      discard: async (id: string) => ({ id, title: 'draft' })
     }
   }
 }
@@ -157,6 +158,30 @@ describe('agent prompts', () => {
     expect(sys).toContain('order-svc.save')
     expect(sys).toContain('回答时先说结论')
   })
+
+  it('puts git remote, repo.local, domain notes, and the build tier into the create prompt', async () => {
+    const lib = copyLibrary()
+    const repo = mkdtempSync(path.join(tmpdir(), 'codemap-prompt-repo-'))
+    mkdirSync(path.join(repo, '.git'), { recursive: true })
+    writeFileSync(path.join(repo, '.git', 'config'), '[remote "origin"]\n\turl = git@git.example.com:shop/order.git\n')
+    writeFileSync(path.join(lib, 'domain.md'), '订单域：先扣库存再创建订单。')
+    const sys = await systemPrompt(lib, 'create', {
+      stack: [],
+      selected: [],
+      flow: null,
+      repos: [repo],
+      output: 'order-svc',
+      buildTier: 'balanced',
+      buildLens: 'service'
+    })
+    expect(sys).toContain('git@git.example.com:shop/order.git')
+    expect(sys).toContain('local:')
+    expect(sys).toContain('订单域：先扣库存再创建订单。')
+    expect(sys).toContain('Build tier: balanced')
+    expect(sys).toContain('Build lens: service')
+    expect(sys).toContain('scan_repo_entrypoints')
+  })
+
 })
 
 describe('merge into base', () => {

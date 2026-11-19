@@ -1,6 +1,6 @@
 import { useSyncExternalStore } from 'react'
 import yaml from 'js-yaml'
-import type { AgentChangeSet, AgentContext, AgentEndReason, AgentEvent, AgentMessageView, AgentMode, AgentPhase, AgentSessionInfo, AgentSessionSummary, AgentSettings, AgentStartRequest, AgentStepView } from '@shared/agent'
+import type { AgentChangeSet, AgentContext, AgentEndReason, AgentEvent, AgentMessageView, AgentMode, AgentPhase, AgentSessionInfo, AgentSessionSummary, AgentSettings, AgentStartRequest, AgentStepView, AgentUsageSummary, BuildLens, BuildTier } from '@shared/agent'
 import { t } from '../lib/i18n'
 import { createLibrary, getCodeMap, reloadCodeMap, setNavigation, setPreview, previewId, type PreviewSet } from './codeMap'
 import { notify, reportError } from './ui'
@@ -35,13 +35,16 @@ export interface AgentState {
   /** Nodes it pointed at earlier in this answer: the path it took to get here. */
   trail: string[]
   note: string | null
-  usage: { input: number; output: number }
+  usage: AgentUsageSummary
   sessions: AgentSessionSummary[]
   settings: AgentSettings | null
   /** Provider override for the next run (empty: follow settings.activeProvider). */
   providerId: string
   /** Model override for the next run (empty: the mode's default). */
   model: string
+  /** Build map speed/depth and the lens used to group the new map. */
+  buildTier: BuildTier
+  buildLens: BuildLens
   /** Repositories and knowledge picked for this conversation. */
   repos: string[]
   docs: SourceDoc[]
@@ -69,22 +72,40 @@ const EMPTY: AgentState = {
   lit: [],
   trail: [],
   note: null,
-  usage: { input: 0, output: 0 },
+  usage: emptyUsage(),
   sessions: [],
   settings: null,
   providerId: '',
   model: '',
+  buildTier: 'balanced',
+  buildLens: 'service',
   repos: [],
   docs: [],
   output: '',
   version: 0
 }
 
+function emptyUsage(): AgentUsageSummary {
+  return { contextTokens: 0, totalInput: 0, totalOutput: 0, workerInput: 0, workerOutput: 0 }
+}
+
+function storedTier(): BuildTier {
+  const value = localStorage.getItem('agent.buildTier')
+  return value === 'fast' || value === 'balanced' || value === 'deep' ? value : 'balanced'
+}
+
+function storedLens(): BuildLens {
+  const value = localStorage.getItem('agent.buildLens')
+  return value === 'service' || value === 'business' || value === 'troubleshoot' ? value : 'service'
+}
+
 let state: AgentState = {
   ...EMPTY,
   mode: (localStorage.getItem('agent.mode') as AgentMode) || 'ask',
   providerId: localStorage.getItem('agent.providerId') || '',
-  model: localStorage.getItem('agent.model') || ''
+  model: localStorage.getItem('agent.model') || '',
+  buildTier: storedTier(),
+  buildLens: storedLens()
 }
 
 // Each mode keeps its own conversation: switching modes goes back to that mode's last one.
@@ -161,6 +182,16 @@ export function setModel(model: string): void {
   if (model) localStorage.setItem('agent.model', model)
   else localStorage.removeItem('agent.model')
   update({ model })
+}
+
+export function setBuildTier(tier: BuildTier): void {
+  localStorage.setItem('agent.buildTier', tier)
+  update({ buildTier: tier })
+}
+
+export function setBuildLens(lens: BuildLens): void {
+  localStorage.setItem('agent.buildLens', lens)
+  update({ buildLens: lens })
 }
 
 /** Switches the chat-bar provider and clears a model chosen for the previous one. */
@@ -249,7 +280,7 @@ export async function refreshSessions(): Promise<void> {
 
 function clearSession(mode: AgentMode): void {
   setPreview(null)
-  update({ mode, sessionId: null, title: '', messages: [], changeSets: [], gate: null, workers: [], lit: [], trail: [], note: null, usage: { input: 0, output: 0 }, repos: [], docs: [], output: '', progress: null, ended: null })
+  update({ mode, sessionId: null, title: '', messages: [], changeSets: [], gate: null, workers: [], lit: [], trail: [], note: null, usage: emptyUsage(), repos: [], docs: [], output: '', progress: null, ended: null })
 }
 
 export function newSession(): void {
@@ -267,6 +298,8 @@ export async function openSession(id: string): Promise<boolean> {
     localStorage.setItem('agent.mode', s.mode)
     rememberSession(s.mode, s.id)
     const lastReply = [...s.messages].reverse().find((m) => m.role === 'assistant')
+    if (s.sources?.buildTier) localStorage.setItem('agent.buildTier', s.sources.buildTier)
+    if (s.sources?.buildLens) localStorage.setItem('agent.buildLens', s.sources.buildLens)
     update({
       sessionId: s.id,
       mode: s.mode,
@@ -281,7 +314,9 @@ export async function openSession(id: string): Promise<boolean> {
       running: false,
       progress: null,
       ended: lastReply?.end ?? null,
-      usage: { input: 0, output: 0 },
+      usage: s.usage ?? emptyUsage(),
+      buildTier: s.sources?.buildTier ?? state.buildTier,
+      buildLens: s.sources?.buildLens ?? state.buildLens,
       repos: s.sources?.repos ?? [],
       docs: s.sources?.docs ?? [],
       output: s.sources?.output ?? ''
@@ -331,7 +366,7 @@ function contextNow(selected: string[]): AgentContext {
   // Building a map starts from the picked repositories and knowledge, not from the open map's
   // selection; the other modes work on the open map and the selected nodes.
   const build = state.mode === 'create'
-  if (build) return { stack: map.stack, selected: [], flow: null, repos: state.repos, docs: state.docs, output: outputFolder() }
+  if (build) return { stack: map.stack, selected: [], flow: null, repos: state.repos, docs: state.docs, output: outputFolder(), buildTier: state.buildTier, buildLens: state.buildLens }
   return { stack: map.stack, selected, flow: map.flowId }
 }
 
@@ -386,6 +421,15 @@ export async function send(message: string, selected: string[] = []): Promise<vo
 /** Create mode: approve the current review gate and let the agent go on. */
 export function approveGate(): Promise<void> {
   return send(t('Approved. Continue with the next step.'))
+}
+
+/** Adjust mode: ask for a child map of one node, switching mode first when needed. */
+export async function drillDownNode(nodeId: string): Promise<void> {
+  if (state.running || !nodeId) return
+  if (state.mode !== 'adjust') await setMode('adjust')
+  if (state.running || state.mode !== 'adjust') return
+  const shortId = nodeId.split('.').pop() || nodeId
+  await send(t('Break down node `{id}` into its child map based on the source code: cover all entrypoints, branches, storage/RPC calls, flows (refining parent flows), links.yaml, and docs/{shortId}.md.', { id: nodeId, shortId }), [nodeId])
 }
 
 export async function stop(): Promise<void> {
@@ -448,11 +492,62 @@ export async function applyChangeSet(set: AgentChangeSet): Promise<void> {
   }
 }
 
-export async function rejectChangeSet(set: AgentChangeSet): Promise<void> {
-  if (!state.sessionId) return
-  await window.codemap.agent.rejectChangeSet(state.sessionId, set.id)
+function dropChangeSet(id: string): AgentChangeSet[] {
+  return state.changeSets.filter((c) => c.id !== id).map((c) => (c.replaces === id ? { ...c, replaces: undefined } : c))
+}
+
+function isStaleDraft(set: AgentChangeSet): boolean {
+  return set.status !== 'applied' && (set.status === 'rejected' || set.problems.some((problem) => problem.level === 'error'))
+}
+
+/** Removes one unapplied draft from the conversation. Applied history cannot be discarded. */
+export async function discardChangeSet(set: AgentChangeSet): Promise<boolean> {
+  if (set.status === 'applied' || !state.sessionId) return false
+  const result = await window.codemap.app.confirm({
+    message: t('Discard draft “{title}” (#{id})?', { title: set.title, id: set.id }),
+    detail: t('This only removes the unapplied draft. Files already written to the node library will not be changed.'),
+    buttons: [t('Discard'), t('Cancel')],
+    cancelId: 1
+  })
+  if (result !== 0) return false
+  try {
+    await window.codemap.agent.discardChangeSet(state.sessionId, set.id)
+  } catch (error) {
+    reportError(error, t('Cannot discard the draft'))
+    return false
+  }
   if (previewId() === set.id) setPreview(null)
-  update({ changeSets: state.changeSets.map((c) => (c.id === set.id ? { ...c, status: 'rejected' as const } : c)) })
+  update({ changeSets: dropChangeSet(set.id) })
+  notify(t('Draft discarded'))
+  return true
+}
+
+/** Confirms, then permanently removes rejected drafts and proposals that still have checker errors. */
+export async function discardStaleDrafts(): Promise<void> {
+  if (!state.sessionId) return
+  const sessionId = state.sessionId
+  const stale = state.changeSets.filter(isStaleDraft)
+  if (!stale.length) return
+  const result = await window.codemap.app.confirm({
+    message: t('Discard {n} unapplied stale drafts?', { n: stale.length }),
+    detail: t('This only removes the unapplied draft. Files already written to the node library will not be changed.'),
+    buttons: [t('Discard'), t('Cancel')],
+    cancelId: 1
+  })
+  if (result !== 0) return
+  let removed = 0
+  for (const set of stale) {
+    try {
+      await window.codemap.agent.discardChangeSet(sessionId, set.id)
+    } catch (error) {
+      reportError(error, t('Cannot discard the draft'))
+      continue
+    }
+    if (previewId() === set.id) setPreview(null)
+    update({ changeSets: dropChangeSet(set.id) })
+    removed++
+  }
+  if (removed) notify(t('Discarded {n} drafts', { n: removed }))
 }
 
 // ---------- Events ----------
@@ -494,6 +589,10 @@ function onEvent(event: AgentEvent): void {
       // The newest proposal shows on the map right away.
       previewChangeSet(event.changeSet)
       break
+    case 'changeset-discarded':
+      if (previewId() === event.changeSetId) setPreview(null)
+      update({ changeSets: dropChangeSet(event.changeSetId) })
+      break
     case 'gate':
       update({ gate: { stage: event.stage, summary: event.summary } })
       break
@@ -524,7 +623,25 @@ function onEvent(event: AgentEvent): void {
       break
     }
     case 'usage':
-      update({ usage: { input: state.usage.input + event.input, output: state.usage.output + event.output } })
+      if (event.isWorker) {
+        update({
+          usage: {
+            ...state.usage,
+            workerInput: (state.usage.workerInput ?? 0) + event.input,
+            workerOutput: (state.usage.workerOutput ?? 0) + event.output,
+            contextTokens: event.contextTokens ?? state.usage.contextTokens
+          }
+        })
+      } else {
+        update({
+          usage: {
+            ...state.usage,
+            contextTokens: event.contextTokens ?? event.input,
+            totalInput: state.usage.totalInput + event.input,
+            totalOutput: state.usage.totalOutput + event.output
+          }
+        })
+      }
       break
     case 'phase': {
       const since = state.progress?.since ?? Date.now()

@@ -170,6 +170,40 @@ describe('model streaming', () => {
     expect(String((fetchMock.mock.calls[0][1] as RequestInit).body)).toContain('"stream":true')
   })
 
+  it('adds Anthropic cache tokens into the prompt total and estimates only a zero report', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () =>
+        sse([
+          'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":20,"cache_read_input_tokens":4000,"cache_creation_input_tokens":30}}}\n\n',
+          'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":7}}\n\n'
+        ])
+      )
+    )
+    const anthropic = { ...provider, kind: 'anthropic' as const, baseUrl: 'http://claude.example' }
+    const streamed = await providers.callModel(anthropic, 'secret-key', {
+      model: 'demo',
+      system: 's',
+      messages: [],
+      tools: [],
+      maxTokens: 16,
+      onTextDelta: () => undefined
+    })
+    expect(streamed.usage).toEqual({ input: 4050, output: 7 })
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => jsonResponse({ content: [{ type: 'text', text: 'plain' }], stop_reason: 'end_turn', usage: { input_tokens: 0, cache_read_input_tokens: 10, output_tokens: 2 } }))
+    )
+    const cached = await providers.callModel(anthropic, 'secret-key', { model: 'demo', system: 'system text', messages: [], tools: [], maxTokens: 16 })
+    expect(cached.usage.input).toBe(10)
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => jsonResponse({ content: [{ type: 'text', text: 'plain' }], stop_reason: 'end_turn', usage: { input_tokens: 0, output_tokens: 2 } }))
+    )
+    const empty = await providers.callModel(anthropic, 'secret-key', { model: 'demo', system: 'abcd', messages: [{ role: 'user', content: [{ type: 'text', text: 'efgh' }] }], tools: [], maxTokens: 16 })
+    expect(empty.usage.input).toBe(Math.ceil(8 / 3.8))
+  })
+
   it('routes ttsw-codex models through the OpenAI Codex endpoint', async () => {
     const fetchMock = vi.fn(async () => jsonResponse({ choices: [{ message: { content: 'routed' }, finish_reason: 'stop' }], usage: { prompt_tokens: 1, completion_tokens: 1 } }))
     vi.stubGlobal('fetch', fetchMock)

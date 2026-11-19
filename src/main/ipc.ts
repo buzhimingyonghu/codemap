@@ -7,7 +7,7 @@ import { DebugSession } from './dap/debugSession'
 import { CodemapAccess, CodemapWatcher, findLibraries, grantable, isLibrary, loadCodemap, readCodemapFile, resolveFolder, writeCodemapLayout, writeCodemapNode } from './codemap/service'
 import { LspManager } from './lsp/manager'
 import type { AgentSettings, AgentStartRequest } from '../shared/agent'
-import { applyChangeSet, deleteSession, getSession, listSessions, rejectChangeSet, startRun, stopRun } from './agent/runtime'
+import { applyChangeSet, deleteSession, discardChangeSet, getSession, listSessions, rejectChangeSet, startRun, stopRun } from './agent/runtime'
 import { getAgentSettings, resolveProvider, saveAgentSettings, setProviderKey, testProviderConnection } from './agent/settings'
 import { listModels } from './agent/providers'
 import { knowledgeRoot } from './agent/knowledge'
@@ -594,6 +594,7 @@ export function registerIpc(): void {
     applyChangeSet(requireLibrary(), getWorkspaceRoot(), String(sessionId), String(changeSetId))
   )
   handle('agent:rejectChangeSet', (_event, sessionId: string, changeSetId: string) => rejectChangeSet(requireLibrary(), String(sessionId), String(changeSetId)))
+  handle('agent:discardChangeSet', (_event, sessionId: string, changeSetId: string) => discardChangeSet(requireLibrary(), String(sessionId), String(changeSetId), (event) => send('agent:event', event)))
   handle('agent:knowledgeDir', () => knowledgeRoot())
   // Picking in the system dialog is the permission to read (like codemap:pickRepository).
   const grantPicked = async (folders: string[]) => {

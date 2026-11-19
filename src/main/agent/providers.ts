@@ -332,8 +332,9 @@ async function callAnthropic(p: AgentProvider, key: string, req: ModelRequest): 
     } else if (data?.type === 'message_delta') {
       stop = anthropicStop(data.delta?.stop_reason)
       usage.output = data.usage?.output_tokens ?? usage.output
+      if (data.usage) usage.input = anthropicInput(data.usage, usage.input)
     } else if (data?.type === 'message_start') {
-      usage.input = data.message?.usage?.input_tokens ?? usage.input
+      usage.input = anthropicInput(data.message?.usage, usage.input)
     }
   }
   const { json, streamed } = await post(
@@ -362,7 +363,7 @@ async function callAnthropic(p: AgentProvider, key: string, req: ModelRequest): 
       else if (c.type === 'tool_use') blocks.push({ type: 'tool_use', id: c.id, name: c.name, input: c.input ?? {} })
     }
     stop = anthropicStop(json.stop_reason)
-    usage = { input: json.usage?.input_tokens ?? 0, output: json.usage?.output_tokens ?? 0 }
+    usage = { input: anthropicInput(json.usage, 0), output: json.usage?.output_tokens ?? 0 }
   } else {
     let text = ''
     for (const event of json as Array<{ data: any }>) {
@@ -378,7 +379,23 @@ async function callAnthropic(p: AgentProvider, key: string, req: ModelRequest): 
     for (const tool of tools.values()) blocks.push({ type: 'tool_use', id: tool.id, name: tool.name, input: parseToolInput(tool.json) })
     if (stop === 'other' && tools.size) stop = 'tool'
   }
-  return { blocks, stop, usage }
+  return { blocks, stop, usage: fillAnthropicUsage(usage, req) }
+}
+
+/** Anthropic input_tokens is the uncached tail. Cached prompt tokens are reported beside it. */
+function anthropicInput(usage: { input_tokens?: number; cache_creation_input_tokens?: number; cache_read_input_tokens?: number } | undefined, fallback: number): number {
+  if (!usage) return fallback
+  const input = usage.input_tokens ?? 0
+  const created = usage.cache_creation_input_tokens ?? 0
+  const read = usage.cache_read_input_tokens ?? 0
+  if (usage.input_tokens == null && created === 0 && read === 0) return fallback
+  return input + created + read
+}
+
+function fillAnthropicUsage(usage: { input: number; output: number }, req: ModelRequest): { input: number; output: number } {
+  if (usage.input > 0) return usage
+  const chars = req.system.length + req.messages.reduce((sum, message) => sum + message.content.reduce((inner, block) => inner + ('text' in block ? block.text.length : 'content' in block ? block.content.length : JSON.stringify(block).length), 0), 0)
+  return { input: Math.ceil(chars / 3.8), output: usage.output }
 }
 
 function anthropicStop(reason: unknown): ModelReply['stop'] {

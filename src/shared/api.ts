@@ -190,6 +190,8 @@ export interface CodemapApi {
     /** Writes an accepted change set into the library; resolves to the files written. */
     applyChangeSet(sessionId: string, changeSetId: string): Promise<string[]>
     rejectChangeSet(sessionId: string, changeSetId: string): Promise<void>
+    /** Permanently removes an unapplied draft change set from the conversation without touching library files. */
+    discardChangeSet(sessionId: string, changeSetId: string): Promise<void>
     /** The knowledge folder the assistant follows (ships with the app). */
     knowledgeDir(): Promise<string>
     /** Folder dialog (multi-select) for repositories; chosen folders become readable. */
