@@ -110,8 +110,17 @@ Use the \`codemap\` MCP server to read and propose a CodeMap. Do not write node 
 
 Pick one tier and one perspective before building:
 
-- Tiers: \`fast\` (L0+L1 skeleton, no review pause), \`balanced\` (one blueprint check, then L0+L1), \`deep\` (stage-by-stage drill-down).
+- Tiers: \`fast\` (L0 panorama + L1 component architecture, no review pause), \`balanced\` (one blueprint check, then L0+L1), \`deep\` (stage-by-stage drill-down). Default scope stops at L0 and L1. Generate a \`kind: function\` execution map only when the user names one node or explicitly picks \`deep\`.
 - Perspectives: \`service\` (microservices, entrypoints, storage), \`business\` (product stages), \`troubleshoot\` (state, retries, timeouts, background jobs).
+
+## Visual hierarchy
+
+Keep L0 and L1 readable:
+
+- Lay the main path out as 2–4 named left-to-right \`lanes\` (for example access, orchestration, domain, downstream). \`lanes.name\` is rendered as the layer title, so use a short Chinese title.
+- Dock non-main nodes: callers \`left\`, config/registry/auth \`top\`, third parties and notification targets \`right\`, DB/Redis/MQ/object storage \`bottom\`.
+- At most 4 nodes in one business column, 8 core business nodes, and 12 nodes on the whole map including docks. Aggregate before adding another box.
+- Node \`name\`: 2–6 Chinese characters. Key edge \`name\`: a 2–6 character verb such as 创建订单 or 锁定库存. Do not mix function nodes into L0 or L1.
 
 Read \`codemap://knowledge/common/guide.md\` and follow \`create/SOP.md\` for the chosen tier and perspective.
 

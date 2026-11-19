@@ -244,6 +244,20 @@ body {
 .lumen-vscode.is-sidebar .cm-select {
   max-width: 140px;
 }
+.lumen-vscode.is-sidebar .cm-tools {
+  gap: 6px;
+}
+.lumen-vscode.is-sidebar .cm-toggle {
+  gap: 3px;
+  font-size: var(--font-size-tiny);
+}
+.lumen-vscode.is-sidebar .cm-flowmode button {
+  padding: 0 6px;
+}
+.lumen-vscode.is-sidebar .cm-chip {
+  height: 22px;
+  padding: 0 7px;
+}
 
 .lumen-vscode.is-sidebar:not(.is-drawer-open) .cm-body {
   grid-template-columns: 1fr;

@@ -556,6 +556,14 @@ export const CodeMapShell: FC<{ root: string; name: string }> & { boot(root: str
   }, [])
 
   useEffect(() => {
+    const openDrawer = () => {
+      if (getVscodePrefs().surface === 'sidebar') setVscodePrefs({ sidebarDrawerOpen: true })
+    }
+    window.addEventListener('codemap:openSidePanel', openDrawer)
+    return () => window.removeEventListener('codemap:openSidePanel', openDrawer)
+  }, [])
+
+  useEffect(() => {
     const onMessage = (event: MessageEvent) => {
       const message = hostPayload(event)
       if (!message) return
