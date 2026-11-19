@@ -174,6 +174,7 @@ export function installVscodeCodemapBridge(): void {
       saveSettings: (settings) => request('agent:saveSettings', [settings]),
       setKey: (providerId, key) => request('agent:setKey', [providerId, key]),
       models: (providerId) => request('agent:models', [providerId]),
+      testConnection: (providerId, model) => request('agent:testConnection', [providerId ?? null, model]),
       start: (req) => request('agent:start', [req]),
       stop: (sessionId) => request('agent:stop', [sessionId]),
       sessions: () => request('agent:sessions'),
