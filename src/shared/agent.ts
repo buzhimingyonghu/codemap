@@ -36,6 +36,14 @@ export interface AgentSettings {
   maxParallel: number
 }
 
+export interface ProviderConnection {
+  ok: boolean
+  model: string
+  kind: ProviderKind
+  latencyMs: number
+  message: string
+}
+
 /** What the user is looking at when a message is sent. */
 export interface AgentContext {
   /** Open map path, top last. */

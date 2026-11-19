@@ -1,8 +1,8 @@
 import { KeyRound, Plus, RefreshCw, Trash2 } from 'lucide-react'
 import { useEffect, useState } from 'react'
-import { AGENT_MODES, type AgentMode, type AgentProvider, type AgentSettings } from '@shared/agent'
+import { AGENT_MODES, type AgentMode, type AgentProvider, type AgentSettings, type ProviderConnection } from '@shared/agent'
 import { t } from '../lib/i18n'
-import { loadAgentSettings, selectProvider } from '../services/agent'
+import { loadAgentSettings, selectProvider, useAgent } from '../services/agent'
 import { notify, reportError } from '../services/ui'
 
 // Settings → AI: which model service the assistant uses and the default model per mode.
@@ -21,10 +21,13 @@ function newProvider(): AgentProvider {
 }
 
 export function AgentSettingsSection() {
+  const agent = useAgent()
   const [s, setS] = useState<AgentSettings | null>(null)
   const [keys, setKeys] = useState<Record<string, string>>({})
   const [models, setModels] = useState<Record<string, string[]>>({})
   const [busy, setBusy] = useState(false)
+  const [testing, setTesting] = useState(false)
+  const [testResult, setTestResult] = useState<ProviderConnection | null>(null)
   useEffect(() => {
     void window.codemap.agent.settings().then(setS, () => setS(null))
   }, [])
@@ -74,6 +77,19 @@ export function AgentSettingsSection() {
   }
   const active = s.providers.find((p) => p.id === s.activeProvider)
   const activeModels = active ? (models[active.id] ?? []) : []
+  const testConnection = async () => {
+    setTesting(true)
+    setTestResult(null)
+    try {
+      const chosenModel = (s.activeProvider === (agent.providerId || agent.settings?.activeProvider) ? agent.model : '') || active?.model || undefined
+      const res = await window.codemap.agent.testConnection(s.activeProvider, chosenModel)
+      setTestResult(res)
+    } catch (error) {
+      setTestResult({ ok: false, model: active?.model ?? '', kind: active?.kind ?? 'openai', latencyMs: 0, message: error instanceof Error ? error.message : String(error) })
+    } finally {
+      setTesting(false)
+    }
+  }
 
   return (
     <section className="field-group">
@@ -175,9 +191,19 @@ export function AgentSettingsSection() {
       </div>
 
       <div className="ai-save">
+        <button type="button" className="button" disabled={busy || testing} onClick={() => void testConnection()}>
+          {testing ? t('Testing connection…') : t('Test Connection')}
+        </button>
         <button type="button" className="button button--primary" disabled={busy} onClick={() => void save()}>
           {t('Save AI settings')}
         </button>
+        {testResult ? (
+          <span className={'ai-provider-state ' + (testResult.ok ? 'is-ok' : 'is-bad')} role="status">
+            {testResult.ok
+              ? `${t('Connected · {ms}ms', { ms: testResult.latencyMs })}${testResult.model ? ` · ${testResult.model} (${testResult.kind})` : ''}`
+              : `${t('Connection test failed')}: ${testResult.message}`}
+          </span>
+        ) : null}
       </div>
     </section>
   )

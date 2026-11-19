@@ -33,7 +33,7 @@ import type {
 } from './types'
 import type { ReplaceResult, SearchQuery, SearchResult } from './search'
 import type { LspHover, LspLocation, LspNavigationKind, LspServerStatus, LspSymbol } from './lsp'
-import type { AgentEvent, AgentSessionInfo, AgentSessionSummary, AgentSettings, AgentStartRequest } from './agent'
+import type { AgentEvent, AgentSessionInfo, AgentSessionSummary, AgentSettings, AgentStartRequest, ProviderConnection } from './agent'
 
 export type Unsubscribe = () => void
 
@@ -179,6 +179,8 @@ export interface CodemapApi {
     setKey(providerId: string, key: string | null): Promise<AgentSettings>
     /** Model ids the provider offers. */
     models(providerId?: string): Promise<string[]>
+    /** Checks that the provider and model answer without returning the key. */
+    testConnection(providerId?: string | null, model?: string): Promise<ProviderConnection>
     /** Starts a run (new session or continuing one); resolves to the session id. Events follow. */
     start(request: AgentStartRequest): Promise<string>
     stop(sessionId: string): Promise<void>

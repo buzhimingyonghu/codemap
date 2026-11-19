@@ -1,6 +1,6 @@
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import path from 'node:path'
-import type { AgentProvider, AgentSettings, ProviderKind } from '../../shared/agent'
+import type { AgentProvider, AgentSettings, ProviderConnection } from '../../shared/agent'
 import { electronSafeStorage, ensureElectronHost, getAgentHost, userDataDir } from './hostAdapter'
 import { LOCAL_CLAUDE_ID, LOCAL_CODEX_ID, callModel, codexRoute, defaultProviders, listModels, localGateways, type LocalGateway } from './providers'
 
@@ -201,14 +201,7 @@ export async function resolveProvider(id?: string | null): Promise<{ provider: A
 export async function rawAgentSettings(): Promise<AgentSettings> {
   return publicView(await withOverride(await load()))
 }
-
-export interface ProviderConnection {
-  ok: boolean
-  model: string
-  kind: ProviderKind
-  latencyMs: number
-  message: string
-}
+export type { ProviderConnection }
 
 /** Checks that the chosen provider answers, without returning the key. */
 export async function testProviderConnection(providerId?: string | null, modelOverride?: string): Promise<ProviderConnection> {

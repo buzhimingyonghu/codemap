@@ -6113,3 +6113,9 @@ button.status-item:hover {
   padding-left: 16px;
   line-height: 1.6;
 }
+.ai-save {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
