@@ -3,11 +3,20 @@ import { mkdir, readFile, realpath, stat, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import type { LspNavigationKind } from '../../src/shared/lsp'
 import { isInside } from '../../src/shared/paths'
+import type { AgentSettings, AgentStartRequest } from '../../src/shared/agent'
 import type { CodemapLayoutPatch, CodemapLoad, CodemapNodePatch, ConfirmOptions, MenuItemSpec, WorkspaceSettings } from '../../src/shared/types'
-import { CodemapWatcher } from '../../src/main/codemap/service'
+import { CodemapWatcher, grantable, resolveFolder } from '../../src/main/codemap/service'
+import { configureAgentHost, knowledgeDir as knowledgeRoot } from '../../src/main/agent/hostAdapter'
+import { applyChangeSet, deleteSession, getSession, injectExternalProposal, listSessions, rejectChangeSet, startRun, stopRun } from '../../src/main/agent/runtime'
+import { getAgentSettings, resolveProvider, saveAgentSettings, setProviderKey, testProviderConnection } from '../../src/main/agent/settings'
+import { listModels } from '../../src/main/agent/providers'
 import { CodeMapBridge } from './host/bridge'
 import { toVsDiagnostic, type YamlDiagnostic } from './host/diagnostics'
 import { createVsCodeLspAdapter, VsCodeLspBridge } from './host/lsp'
+import { createAgentLspTools } from './host/agentLsp'
+import { LoopbackMcpBridge } from './host/mcpBridge'
+import { resolveAgentKnowledgeDir } from './host/knowledge'
+import { appendTomlSnippet, jsonSnippet, setupExternalAgents, tomlSnippet, type ExternalMcpConfig } from './host/externalSetup'
 import { ProjectMapHost } from './host/projectMap'
 import { isHostRequest, type HostEvent } from './host/protocol'
 import { dispatch, type RpcHandler } from './host/rpc'
@@ -49,9 +58,12 @@ let workspaceWatcher: vscode.FileSystemWatcher | undefined
 let yamlWatcher: vscode.FileSystemWatcher | undefined
 let lspBridge: VsCodeLspBridge | undefined
 let projectMapHost: ProjectMapHost | undefined
+let mcpBridge: LoopbackMcpBridge | undefined
+let mcpProvider: vscode.Disposable | undefined
 const hub = new SurfaceHub()
 const cursorFollow = new CursorFollowController((target) => hub.broadcastAction({ kind: 'cursor', path: target.path, line: target.line }))
 const EXTERNAL_READ_LIMIT = 8 * 1024 * 1024
+const SECRET_PREFIX = 'codemap.agent.key.'
 
 export function activate(context: vscode.ExtensionContext): void {
   const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? null
@@ -60,11 +72,14 @@ export function activate(context: vscode.ExtensionContext): void {
     pickFolder: (defaultPath) => pickFolder(defaultPath),
     confirm: (options) => confirmDialog(options),
     quickPick: (items) => popupMenu(items),
-    warning: (message, detail, allow) => accessWarning(message, detail, allow)
+    warning: (message, detail, allow) => accessWarning(message, detail, allow),
+    libraryPath: () => configuredLibraryPath()
   })
   bridge.setLocale(vscode.env.language.toLowerCase().startsWith('zh') ? 'zh' : 'en')
   const savedSettings = readState<WorkspaceSettings>(context.workspaceState, SETTINGS_KEY, LEGACY_SETTINGS_KEY)
   if (savedSettings) bridge.setSettings(savedSettings)
+  cursorFollow.setEnabled(initialFollowCursor(context))
+  configureAgentHost(agentHost(context))
   diagnostics = vscode.languages.createDiagnosticCollection('codemap')
   lspBridge = new VsCodeLspBridge(createVsCodeLspAdapter(vscode))
   projectMapHost = new ProjectMapHost(() => bridge?.getRoot() ?? null, {
@@ -120,6 +135,10 @@ export function activate(context: vscode.ExtensionContext): void {
       if (!event.affectsConfiguration('workbench.sideBar.location')) return
       hub.broadcastAction({ kind: 'sidebarSide', side: currentSidebarSide() })
     }),
+    vscode.workspace.onDidChangeConfiguration((event) => {
+      if (event.affectsConfiguration('codemap.mcp.enabled') || event.affectsConfiguration('codemap.libraryPath')) void syncMcpBridge(context)
+      if (event.affectsConfiguration('codemap.followCursor') && !readSnapshot(context)) cursorFollow.setEnabled(initialFollowCursor(context))
+    }),
     vscode.window.onDidChangeActiveTextEditor(pushEditorCursor),
     vscode.window.onDidChangeTextEditorSelection((event) => pushEditorCursor(event.textEditor))
   )
@@ -143,9 +162,13 @@ export function activate(context: vscode.ExtensionContext): void {
       post({ type: 'event', channel: 'codemap:changed' })
     }),
     vscode.commands.registerCommand('codemap.codemap.validate', () => refreshLibrary(context, false)),
-    vscode.commands.registerCommand('codemap.codemap.manageGrants', () => manageGrants(context))
+    vscode.commands.registerCommand('codemap.codemap.manageGrants', () => manageGrants(context)),
+    vscode.commands.registerCommand('codemap.codemap.initLibrary', () => initLibraryCommand(context)),
+    vscode.commands.registerCommand('codemap.agent.openSettings', () => openSettingsCommand(context)),
+    vscode.commands.registerCommand('codemap.agent.askSelection', () => askSelectionCommand(context)),
+    vscode.commands.registerCommand('codemap.mcp.setup', () => setupMcpCommand(context))
   )
-  void refreshLibrary(context, false)
+  void refreshLibrary(context, false).finally(() => void syncMcpBridge(context))
 }
 
 export function deactivate(): void {
@@ -156,6 +179,11 @@ export function deactivate(): void {
   panel?.dispose()
   hub.detach('sidebar')
   hub.detach('panel')
+  mcpProvider?.dispose()
+  mcpProvider = undefined
+  void mcpBridge?.dispose()
+  mcpBridge = undefined
+  configureAgentHost(null)
 }
 
 function attachPanel(context: vscode.ExtensionContext, targetPanel: vscode.WebviewPanel): void {
@@ -319,6 +347,12 @@ function handlers(context: vscode.ExtensionContext, surface: WebviewSurface): Re
       await rememberLibrary(context, load)
       return load
     },
+    'codemap:createLibrary': async ([folder]) => {
+      const load = await current.createLibrary(folder == null ? undefined : String(folder))
+      if (load) await rememberLibrary(context, load)
+      return load
+    },
+    'codemap:initDefaultLibrary': async () => initAndRememberDefaultLibrary(context),
     'codemap:pickRepository': () => current.pickRepository(),
     'codemap:writeLayout': async ([file, patch]) => {
       await current.writeLayout(String(file), patch as CodemapLayoutPatch, (target, content) => libraryWatcher?.expectOwnWrite(target, content))
@@ -474,7 +508,37 @@ function handlers(context: vscode.ExtensionContext, surface: WebviewSurface): Re
         }
       }
       return consumeReadyPayload(actions)
-    }
+    },
+    'agent:settings': () => getAgentSettings(),
+    'agent:saveSettings': ([settings]) => saveAgentSettings(settings as AgentSettings),
+    'agent:setKey': ([providerId, key]) => setProviderKey(String(providerId), key ? String(key) : null),
+    'agent:models': async ([providerId]) => {
+      const { provider, key } = await resolveProvider(providerId ? String(providerId) : null)
+      return listModels(provider, key)
+    },
+    'agent:testConnection': ([providerId, model]) => testProviderConnection(providerId ? String(providerId) : null, model ? String(model) : undefined),
+    'agent:start': async ([req]) => {
+      const request = req as AgentStartRequest
+      const lib = await ensureAgentLibrary(context, request)
+      return startRun(lib, current.access, request, (event) => post({ type: 'event', channel: 'agent:event', payload: event }), { lsp: agentLsp() })
+    },
+    'agent:stop': ([sessionId]) => stopRun(String(sessionId)),
+    'agent:sessions': () => (current.getLibrary() ? listSessions(current.getLibrary()!) : []),
+    'agent:session': ([id]) => getSession(requireLibrary(), String(id)),
+    'agent:deleteSession': ([id]) => deleteSession(requireLibrary(), String(id)),
+    'agent:applyChangeSet': async ([sessionId, changeSetId]) => {
+      const lib = requireLibrary()
+      const written = await applyChangeSet(lib, current.getRoot(), String(sessionId), String(changeSetId))
+      await refreshLibrary(context, true)
+      post({ type: 'event', channel: 'codemap:changed' })
+      return written
+    },
+    'agent:rejectChangeSet': ([sessionId, changeSetId]) => rejectChangeSet(requireLibrary(), String(sessionId), String(changeSetId)),
+    'agent:knowledgeDir': () => knowledgeRoot(),
+    'agent:pickRepos': () => pickGrantedFolders(context),
+    'agent:pickDocs': () => pickGrantedDocs(context),
+    'host:setupExternalMcp': () => runExternalMcpSetupInteractive(context),
+    'host:openVsCodeSettings': () => vscode.commands.executeCommand('workbench.action.openSettings', 'codemap')
   }
 }
 
@@ -493,6 +557,7 @@ async function rememberLibrary(context: vscode.ExtensionContext, load: CodemapLo
   libraryWatcher?.start(load.library)
   watchLibrary(context, load.library)
   publishDiagnostics(bridge!.diagnostics(load))
+  mcpBridge?.updateContext({ workspaceRoot: bridge!.getRoot(), library: load.library })
 }
 
 async function refreshLibrary(context: vscode.ExtensionContext, quiet: boolean): Promise<void> {
@@ -538,6 +603,7 @@ function onWorkspaceFoldersChanged(context: vscode.ExtensionContext): void {
   const { root, name } = workspaceIdentity()
   bridge?.setRoot(root || null)
   void refreshLibrary(context, true)
+  void syncMcpBridge(context)
   post({ type: 'event', channel: 'host:workspace', payload: { root, name } })
 }
 
@@ -597,13 +663,20 @@ async function openSmart(context: vscode.ExtensionContext): Promise<void> {
     await handoffToPanel(context)
     return
   }
+  if (sidebarView?.visible) return
   const snapshot = readSnapshot(context)
   if (snapshot && isHostMode(snapshot.mode)) {
-    await openPanel(context)
+    await openPreferredSurface(context)
     return
   }
   const savedMode = readState<HostMode>(context.workspaceState, LAST_MODE_KEY, LEGACY_LAST_MODE_KEY)
   const preferred: HostMode = savedMode === 'map' || savedMode === 'codemap' ? savedMode : bridge?.getLibrary() ? 'codemap' : 'map'
+  if (defaultSurface() === 'sidebar') {
+    await context.workspaceState.update(LAST_MODE_KEY, preferred)
+    await collapseToSidebar(context)
+    hub.send('sidebar', { kind: 'mode', mode: preferred })
+    return
+  }
   await openWithAction(context, { kind: 'mode', mode: preferred })
 }
 
@@ -763,4 +836,286 @@ function workspaceIdentity(): { root: string; name: string } {
 
 function randomNonce(): string {
   return [...crypto.getRandomValues(new Uint8Array(16))].map((byte) => byte.toString(16).padStart(2, '0')).join('')
+}
+
+function agentHost(context: vscode.ExtensionContext) {
+  return {
+    userDataDir: () => {
+      const dir = context.globalStorageUri.fsPath
+      void mkdir(dir, { recursive: true })
+      return dir
+    },
+    knowledgeDir: () => resolveAgentKnowledgeDir(context.extensionUri.fsPath),
+    getSecret: async (id: string) => (await context.secrets.get(`${SECRET_PREFIX}${id}`)) ?? null,
+    setSecret: async (id: string, secret: string | null) => {
+      const key = `${SECRET_PREFIX}${id}`
+      if (secret) await context.secrets.store(key, secret)
+      else await context.secrets.delete(key)
+    },
+    hasSecret: async (id: string) => Boolean(await context.secrets.get(`${SECRET_PREFIX}${id}`)),
+    loadSettingsOverride: () => ({ maxParallel: vscode.workspace.getConfiguration('codemap').get<number>('agent.maxParallel', 3) }),
+    saveSettingsOverride: async (settings: AgentSettings) => {
+      await vscode.workspace.getConfiguration('codemap').update('agent.maxParallel', settings.maxParallel, vscode.ConfigurationTarget.Global)
+    }
+  }
+}
+
+function configuredLibraryPath(): string {
+  return vscode.workspace.getConfiguration('codemap').get<string>('libraryPath', '') ?? ''
+}
+
+function defaultSurface(): 'panel' | 'sidebar' {
+  return vscode.workspace.getConfiguration('codemap').get<string>('defaultSurface', 'panel') === 'sidebar' ? 'sidebar' : 'panel'
+}
+
+function initialFollowCursor(context: vscode.ExtensionContext): boolean {
+  const snapshot = readSnapshot(context)
+  if (typeof snapshot?.followCursor === 'boolean') return snapshot.followCursor
+  return vscode.workspace.getConfiguration('codemap').get<boolean>('followCursor', false)
+}
+
+async function openPreferredSurface(context: vscode.ExtensionContext): Promise<void> {
+  if (defaultSurface() === 'sidebar') await collapseToSidebar(context)
+  else await openPanel(context)
+}
+
+function requireLibrary(): string {
+  const library = bridge?.getLibrary()
+  if (!library) throw new Error('Open a code map first')
+  return library
+}
+
+async function initAndRememberDefaultLibrary(context: vscode.ExtensionContext): Promise<CodemapLoad> {
+  const load = await bridge!.initDefaultLibrary()
+  await rememberLibrary(context, load)
+  post({ type: 'event', channel: 'codemap:changed' })
+  return load
+}
+
+async function ensureAgentLibrary(context: vscode.ExtensionContext, request: AgentStartRequest): Promise<string> {
+  const open = bridge?.getLibrary()
+  if (open) return open
+  if (request.mode === 'create' && bridge?.getRoot()) return (await initAndRememberDefaultLibrary(context)).library!
+  throw new Error('Open a code map first')
+}
+
+function agentLsp() {
+  return lspBridge ? createAgentLspTools(lspBridge) : undefined
+}
+
+async function persistGrants(context: vscode.ExtensionContext): Promise<void> {
+  await context.globalState.update(GRANTS_KEY, bridge!.access.list())
+}
+
+async function grantResolved(context: vscode.ExtensionContext, folders: string[]): Promise<void> {
+  let changed = false
+  for (const folder of folders) {
+    if (!grantable(folder) || bridge!.access.allowed(folder)) continue
+    bridge!.grant(folder)
+    changed = true
+  }
+  if (changed) await persistGrants(context)
+}
+
+async function pickGrantedFolders(context: vscode.ExtensionContext): Promise<string[]> {
+  const picked = await vscode.window.showOpenDialog({
+    canSelectFolders: true,
+    canSelectFiles: false,
+    canSelectMany: true,
+    defaultUri: bridge?.getRoot() ? vscode.Uri.file(bridge.getRoot()!) : undefined
+  })
+  if (!picked?.length) return []
+  const folders = await Promise.all(picked.map((uri) => resolveFolder(uri.fsPath)))
+  await grantResolved(context, folders)
+  return folders
+}
+
+async function pickGrantedDocs(context: vscode.ExtensionContext): Promise<string[]> {
+  const picked = await vscode.window.showOpenDialog({
+    canSelectFolders: false,
+    canSelectFiles: true,
+    canSelectMany: true,
+    defaultUri: bridge?.getRoot() ? vscode.Uri.file(bridge.getRoot()!) : undefined
+  })
+  if (!picked?.length) return []
+  const files = await Promise.all(picked.map((uri) => realpath(uri.fsPath)))
+  await grantResolved(context, [...new Set(files.map((file) => path.dirname(file)))])
+  return files
+}
+
+async function initLibraryCommand(context: vscode.ExtensionContext): Promise<void> {
+  const load = await initAndRememberDefaultLibrary(context)
+  await openPanel(context)
+  hub.send('panel', { kind: 'mode', mode: 'codemap' })
+  const zh = vscode.env.language.toLowerCase().startsWith('zh')
+  void vscode.window.showInformationMessage(zh ? `CodeMap 已初始化节点库：${load.library}` : `CodeMap initialized ${load.library}`)
+}
+
+async function openSettingsCommand(context: vscode.ExtensionContext): Promise<void> {
+  const target = await activeOrPanel(context)
+  hub.send(target, { kind: 'openAiSettings' })
+}
+
+async function askSelectionCommand(context: vscode.ExtensionContext): Promise<void> {
+  const editor = vscode.window.activeTextEditor
+  if (!editor || editor.document.uri.scheme !== 'file' || editor.selection.isEmpty) {
+    void vscode.window.showInformationMessage('CodeMap: select code in an editor first.')
+    return
+  }
+  const target: WebviewSurface = sidebarView?.visible ? 'sidebar' : 'panel'
+  if (target === 'panel') await openPanel(context)
+  const start = editor.selection.start.line + 1
+  const end = editor.selection.end.line + 1
+  hub.send(target, {
+    kind: 'askSelection',
+    path: editor.document.uri.fsPath,
+    startLine: Math.min(start, end),
+    endLine: Math.max(start, end),
+    mode: 'ask'
+  })
+}
+
+async function activeOrPanel(context: vscode.ExtensionContext): Promise<WebviewSurface> {
+  if (sidebarView?.visible) return 'sidebar'
+  if (panel) return 'panel'
+  await openPanel(context)
+  return 'panel'
+}
+
+async function setupMcpCommand(context: vscode.ExtensionContext): Promise<void> {
+  const zh = vscode.env.language.toLowerCase().startsWith('zh')
+  const picked = await vscode.window.showQuickPick(
+    [
+      { label: 'Cursor (.cursor/mcp.json)', id: 'cursor' },
+      { label: 'Claude Code (.mcp.json)', id: 'claude' },
+      { label: 'Codex CLI (~/.codex/config.toml snippet)', id: 'codex' },
+      { label: 'All Workspace Configs (.cursor + .mcp.json)', id: 'all' },
+      { label: 'Copy MCP JSON to Clipboard', id: 'copy' }
+    ],
+    { placeHolder: zh ? 'CodeMap 要写入哪个外部 AI 配置？' : 'Where should CodeMap write the external AI config?' }
+  )
+  if (!picked) return
+  const config = externalMcpConfig(context)
+  if (picked.id === 'copy') {
+    await vscode.env.clipboard.writeText(jsonSnippet(config))
+    void vscode.window.showInformationMessage(zh ? 'CodeMap MCP JSON 已复制到剪贴板。' : 'CodeMap MCP JSON copied to the clipboard.')
+    return
+  }
+  if (picked.id === 'codex') {
+    const file = path.join(process.env.HOME || '', '.codex', 'config.toml')
+    const changed = appendTomlSnippet(file, tomlSnippet(config))
+    void vscode.window.showInformationMessage(
+      changed
+        ? zh
+          ? `CodeMap 已写入 ${file}`
+          : `CodeMap wrote ${file}`
+        : zh
+          ? `CodeMap 已经在 ${file}`
+          : `CodeMap is already in ${file}`
+    )
+    return
+  }
+  const result = setupExternalAgents(config)
+  const written =
+    picked.id === 'cursor' ? [result.cursorChanged ? result.cursorFile : ''] : picked.id === 'claude' ? [result.claudeChanged ? result.claudeFile : ''] : [result.cursorFile, result.claudeFile].filter(Boolean)
+  const files = written.filter(Boolean)
+  void vscode.window.showInformationMessage(
+    files.length
+      ? zh
+        ? `CodeMap 已更新 ${files.join(', ')}`
+        : `CodeMap updated ${files.join(', ')}`
+      : zh
+        ? 'CodeMap MCP 配置已经是最新。'
+        : 'CodeMap MCP config is already current.'
+  )
+}
+
+export async function runExternalMcpSetupInteractive(context: vscode.ExtensionContext): Promise<void> {
+  await setupMcpCommand(context)
+}
+
+function externalMcpConfig(context: vscode.ExtensionContext): ExternalMcpConfig {
+  const workspaceRoot = bridge?.getRoot() ?? vscode.workspace.workspaceFolders?.[0]?.uri.fsPath
+  if (!workspaceRoot) throw new Error('Open a folder first')
+  return {
+    workspaceRoot,
+    mcpScriptPath: path.join(context.extensionUri.fsPath, 'dist', 'codemap-mcp.cjs'),
+    registryDir: path.join(context.globalStorageUri.fsPath, 'mcp-registry'),
+    knowledgeDir: resolveAgentKnowledgeDir(context.extensionUri.fsPath),
+    command: 'node'
+  }
+}
+
+async function syncMcpBridge(context: vscode.ExtensionContext): Promise<void> {
+  const enabled = vscode.workspace.getConfiguration('codemap').get<boolean>('mcp.enabled', true)
+  if (!enabled) {
+    mcpProvider?.dispose()
+    mcpProvider = undefined
+    await mcpBridge?.dispose()
+    mcpBridge = undefined
+    return
+  }
+  const workspaceRoot = bridge?.getRoot() ?? null
+  const library = bridge?.getLibrary() ?? null
+  const registryDir = path.join(context.globalStorageUri.fsPath, 'mcp-registry')
+  if (!mcpBridge) {
+    mcpBridge = await LoopbackMcpBridge.start({
+      registryDir,
+      workspaceRoot,
+      library,
+      knowledgeDir: resolveAgentKnowledgeDir(context.extensionUri.fsPath),
+      access: bridge?.access,
+      agentLsp: agentLsp(),
+      callbacks: {
+        onShowOnMap: (request) => showExternalOnMap(context, request),
+        onExternalProposal: (proposal) => acceptExternalProposal(context, proposal)
+      }
+    })
+    registerNativeMcp(context, registryDir)
+    return
+  }
+  mcpBridge.updateContext({ workspaceRoot, library })
+}
+
+async function showExternalOnMap(context: vscode.ExtensionContext, request: { map: string | null; nodes: string[]; flow: string | null; note?: string }): Promise<void> {
+  const target: WebviewSurface = sidebarView?.visible ? 'sidebar' : 'panel'
+  if (target === 'panel') await openPanel(context)
+  hub.send(target, { kind: 'externalFocus', map: request.map, nodes: request.nodes, flow: request.flow, note: request.note })
+}
+
+async function acceptExternalProposal(
+  context: vscode.ExtensionContext,
+  proposal: { title: string; summary: string; changes: Record<string, unknown>[]; files: Record<string, string>; requirement?: { id: string; name: string; desc?: string } }
+) {
+  const lib = bridge?.getLibrary() ?? (bridge?.getRoot() ? (await initAndRememberDefaultLibrary(context)).library : null)
+  if (!lib) throw new Error('Open a workspace with a CodeMap library first')
+  const saved = await injectExternalProposal(
+    lib,
+    { title: proposal.title, summary: proposal.summary, changes: proposal.changes, files: proposal.files, requirement: proposal.requirement },
+    (event) => post({ type: 'event', channel: 'agent:event', payload: event })
+  )
+  const target: WebviewSurface = sidebarView?.visible ? 'sidebar' : 'panel'
+  if (target === 'panel') await openPanel(context)
+  hub.send(target, { kind: 'externalProposal', sessionId: saved.sessionId, changeSetId: saved.changeSet.id })
+}
+
+function registerNativeMcp(context: vscode.ExtensionContext, registryDir: string): void {
+  if (mcpProvider) return
+  const lm = (vscode as unknown as { lm?: { registerMcpServerDefinitionProvider?: (id: string, provider: unknown) => vscode.Disposable } }).lm
+  if (!lm?.registerMcpServerDefinitionProvider) return
+  try {
+    const Definition = (vscode as unknown as { McpStdioServerDefinition?: new (label: string, command: string, args: string[]) => unknown }).McpStdioServerDefinition
+    if (!Definition) return
+    mcpProvider = lm.registerMcpServerDefinitionProvider('codemap', {
+      provideMcpServerDefinitions: () => {
+        const config = externalMcpConfig(context)
+        return [
+          new Definition('CodeMap', 'node', [config.mcpScriptPath, '--registry-dir', registryDir, '--knowledge-dir', config.knowledgeDir, '--workspace', config.workspaceRoot])
+        ]
+      }
+    })
+    context.subscriptions.push(mcpProvider)
+  } catch {
+    mcpProvider = undefined
+  }
 }

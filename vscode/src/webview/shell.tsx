@@ -7,6 +7,7 @@ import { PromptDialog, Toasts } from '../../../src/renderer/src/workbench/Overla
 import { applyTheme } from '../../../src/renderer/src/editor/themes'
 import { setLocale, useLocale } from '../../../src/renderer/src/lib/i18n'
 import { registerCommand } from '../../../src/renderer/src/services/commands'
+import { getAgent, initAgent, openSession, previewChangeSet, setMode } from '../../../src/renderer/src/services/agent'
 import {
   chooseLibrary,
   ensureCodeMap,
@@ -18,7 +19,8 @@ import {
   reloadCodeMap,
   setNavigation,
   subscribeCodeMap,
-  toggleRequirement
+  toggleRequirement,
+  useCodeMap
 } from '../../../src/renderer/src/services/codeMap'
 import { closeTab, getActiveTab, saveActive, saveAll } from '../../../src/renderer/src/services/documents'
 import { refreshGit } from '../../../src/renderer/src/services/git'
@@ -27,8 +29,9 @@ import { goToLastEdit, navigateHistory } from '../../../src/renderer/src/service
 import { useSearch } from '../../../src/renderer/src/services/search'
 import { handleFsChanges } from '../../../src/renderer/src/services/workspace'
 import { getState, setState, useStore } from '../../../src/renderer/src/state/store'
-import { isInside } from '../../../src/shared/paths'
+import { isInside, relativePath } from '../../../src/shared/paths'
 import { prefixOf } from '../../../src/shared/codemap/codemap.mjs'
+import type { AgentChangeSet, AgentMode } from '@shared/agent'
 import type { NavigationSnapshot } from '../host/session'
 import {
   getWebviewPersistedState,
@@ -45,6 +48,8 @@ import {
 import { installWebviewKeys } from './keys'
 import { getVscodePrefs, setVscodePrefs, subscribeVscodePrefs, useVscodePrefs, withInternalReveal } from './prefs'
 import { VscodeTopBar } from './TopBar'
+import { AiSettingsDrawer } from './AiSettingsDrawer'
+import { ColdStartGuide } from './ColdStartGuide'
 import { ensureMap, initProjectMap, rememberFocus, rememberedFocus, revealInExplorer, setExplorerMode, subscribeMap, toAbsolute } from './wrappers/projectMap'
 import { refitCodeMaps } from './wrappers/codeMapEngine'
 import { refitProjectMaps } from './wrappers/mapEngine'
@@ -85,6 +90,7 @@ function boot(root: string, name: string): void {
   })
   registerLanguageFeatures()
   initCodeMap()
+  initAgent()
   initProjectMap()
   registerCommand('file.save', () => saveActive(), { title: 'Save', category: 'File', source: 'core' })
   registerCommand('file.saveAll', () => saveAll(), { title: 'Save All', category: 'File', source: 'core' })
@@ -244,7 +250,7 @@ function installSnapshotWatch(): () => void {
     const root = getState().workspace?.root
     if (!root) return
     const rel = rememberedFocus(root) ?? ''
-    const key = `${root} ${rel}`
+    const key = `${root}${rel}`
     if (key === lastFocusKey) return
     lastFocusKey = key
     scheduleSnapshot()
@@ -322,10 +328,172 @@ function collapseToSidebar(): void {
   void request('host:collapseToSidebar', [captureSnapshot()])
 }
 
+
+interface AskSelectionPayload {
+  path: string
+  startLine: number
+  endLine: number
+  mode?: AgentMode
+}
+
+interface ExternalFocusPayload {
+  map: string | null
+  nodes: string[]
+  flow?: string | null
+  note?: string
+}
+
+interface ExternalProposalPayload {
+  sessionId: string
+  changeSetId?: string
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === 'object'
+}
+
+function hostPayload(event: MessageEvent): { channel: string; payload: unknown } | null {
+  const data = event.data
+  if (!isRecord(data) || data.type !== 'event' || typeof data.channel !== 'string') return null
+  return { channel: data.channel, payload: data.payload }
+}
+
+async function askSelection(payload: AskSelectionPayload): Promise<void> {
+  selectMode('codemap')
+  await ensureCodeMap()
+  const ctx = mapContext()
+  const nodeId = nodesForCode(payload.path, payload.startLine)[0]
+  if (ctx && nodeId) {
+    const map = mapForNode(ctx, nodeId)
+    if (map) setNavigation([map], null, nodeId)
+  }
+  if (getVscodePrefs().surface === 'sidebar') setVscodePrefs({ sidebarDrawerOpen: true })
+  document.getElementById('cm-tab-ai')?.click()
+  const mode = payload.mode ?? 'ask'
+  if (getAgent().mode !== mode) await setMode(mode)
+  fillAgentInput(selectionPrefix(payload))
+}
+
+function selectionPrefix(payload: AskSelectionPayload): string {
+  const root = getState().workspace?.root ?? ''
+  const rel = root && isInside(root, payload.path) ? relativePath(root, payload.path) : payload.path
+  const end = payload.endLine || payload.startLine
+  return `[${rel}:${payload.startLine}-${end}] `
+}
+
+function fillAgentInput(prefix: string): void {
+  const write = () => {
+    const input = document.querySelector<HTMLTextAreaElement>('.ag-input')
+    if (!input) return false
+    const proto = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')
+    proto?.set?.call(input, prefix)
+    input.dispatchEvent(new Event('input', { bubbles: true }))
+    input.focus()
+    return true
+  }
+  if (write()) return
+  requestAnimationFrame(() => {
+    if (!write()) requestAnimationFrame(write)
+  })
+}
+
+async function externalFocus(payload: ExternalFocusPayload): Promise<void> {
+  selectMode('codemap')
+  await ensureCodeMap()
+  const nodes = payload.nodes.filter((id) => typeof id === 'string')
+  const data = getCodeMap()
+  if (!data.check) return
+  const model = data.check.model
+  const target = payload.map && model.members.has(payload.map) ? payload.map : mapOfExternal(nodes[0])
+  if (!target || !model.members.has(target)) return
+  const index = data.stack.indexOf(target)
+  const stack = index >= 0 ? data.stack.slice(0, index + 1) : pathToExternal(target)
+  const sameMap = target === data.stack[data.stack.length - 1]
+  setNavigation(stack, payload.flow ?? (sameMap ? data.flowId : null), nodes[0] ?? null)
+  window.setTimeout(() => paintExternalMarks(nodes, payload.note), 0)
+}
+
+function paintExternalMarks(nodes: string[], note?: string): void {
+  const lit = new Set(nodes)
+  for (const el of document.querySelectorAll<SVGGElement>('g.cm-node')) {
+    const id = el.dataset.id ?? ''
+    el.classList.toggle('agent', lit.has(id))
+    el.querySelector('.cm-agent-note')?.remove()
+  }
+  if (!note || !nodes[0]) return
+  const first = document.querySelector<SVGGElement>(`g.cm-node[data-id="${cssEscape(nodes[0])}"]`)
+  const shape = first?.querySelector<SVGGraphicsElement>('.cm-shape')
+  if (!first || !shape) return
+  const box = shape.getBBox()
+  const text = note.length > 80 ? `${note.slice(0, 79)}…` : note
+  const width = Math.min(340, Math.max(60, text.length * 12 + 20))
+  const x = box.x + box.width / 2
+  const y = box.y - 12
+  const noteNode = document.createElementNS('http://www.w3.org/2000/svg', 'g')
+  noteNode.setAttribute('class', 'cm-agent-note')
+  noteNode.innerHTML = `<rect x="${x - width / 2}" y="${y - 22}" width="${width}" height="22" rx="11"/><path d="M${x - 5},${y} L${x},${y + 6} L${x + 5},${y} Z"/><text x="${x}" y="${y - 7}">${escapeXml(text)}</text>`
+  first.appendChild(noteNode)
+}
+
+function cssEscape(value: string): string {
+  return window.CSS?.escape ? window.CSS.escape(value) : value.replace(/["\\]/g, '\\$&')
+}
+
+function escapeXml(value: string): string {
+  return value.replace(/[&<>"]/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[char] ?? char)
+}
+
+function mapOfExternal(id: string | undefined): string | null {
+  if (!id) return null
+  const model = getCodeMap().check?.model
+  if (!model) return null
+  const up = [...(model.containedBy.get(id) ?? [])]
+  if (up.length) return up[0]
+  for (const [map, members] of model.members) if (members.includes(id)) return map
+  return null
+}
+
+function pathToExternal(id: string): string[] {
+  const model = getCodeMap().check?.model
+  if (!model) return [id]
+  const out = [id]
+  const seen = new Set([id])
+  let current = id
+  for (;;) {
+    const up = [...(model.containedBy.get(current) ?? [])].find((parent) => !seen.has(parent))
+    if (!up) break
+    out.unshift(up)
+    seen.add(up)
+    current = up
+  }
+  return out
+}
+
+async function externalProposal(payload: ExternalProposalPayload): Promise<void> {
+  if (!payload.sessionId) return
+  selectMode('codemap')
+  await ensureCodeMap()
+  const opened = await openSession(payload.sessionId)
+  if (!opened) return
+  const sets = getAgent().changeSets
+  const chosen = (payload.changeSetId ? sets.find((set) => set.id === payload.changeSetId) : null) ?? latestProposal(sets)
+  if (chosen) previewChangeSet(chosen)
+  if (getVscodePrefs().surface === 'sidebar') setVscodePrefs({ sidebarDrawerOpen: true })
+  document.getElementById('cm-tab-ai')?.click()
+}
+
+function latestProposal(sets: AgentChangeSet[]): AgentChangeSet | null {
+  const proposed = sets.filter((set) => set.status === 'proposed')
+  return proposed.at(-1) ?? sets.at(-1) ?? null
+}
+
+
 export const CodeMapShell: FC<{ root: string; name: string }> & { boot(root: string, name: string): void } = function CodeMapShell({ root, name }) {
   useLocale()
   const panelVisible = useStore((s) => s.panelVisible)
   const explorerMode = useStore((s) => s.explorerMode)
+  const settingsOpen = useStore((s) => s.settingsOpen)
+  const codeMap = useCodeMap()
   const { surface, sidebarDrawerOpen, sidebarSide } = useVscodePrefs()
   useEffect(() => {
     boot(root, name)
@@ -387,6 +555,30 @@ export const CodeMapShell: FC<{ root: string; name: string }> & { boot(root: str
     })
   }, [])
 
+  useEffect(() => {
+    const onMessage = (event: MessageEvent) => {
+      const message = hostPayload(event)
+      if (!message) return
+      if (message.channel === 'host:openAiSettings') {
+        setState({ settingsOpen: true })
+        return
+      }
+      if (message.channel === 'host:askSelection' && isAskSelection(message.payload)) {
+        void askSelection(message.payload)
+        return
+      }
+      if (message.channel === 'host:externalFocus' && isExternalFocus(message.payload)) {
+        void externalFocus(message.payload)
+        return
+      }
+      if (message.channel === 'host:externalProposal' && isExternalProposal(message.payload)) void externalProposal(message.payload)
+    }
+    window.addEventListener('message', onMessage)
+    return () => window.removeEventListener('message', onMessage)
+  }, [])
+
+  const coldStart = explorerMode === 'codemap' && codeMap.status === 'none'
+
   return (
     <div
       className={`lumen-vscode${surface === 'sidebar' ? ` is-sidebar is-dock-${sidebarSide}` : ''}${sidebarDrawerOpen ? ' is-drawer-open' : ''}`}
@@ -394,17 +586,43 @@ export const CodeMapShell: FC<{ root: string; name: string }> & { boot(root: str
     >
       <VscodeTopBar onSelectMode={selectMode} onExpandToPanel={expandToPanel} onCollapseToSidebar={collapseToSidebar} />
       <div className="lumen-vscode-stage">
-        {explorerMode === 'map' ? <ProjectMapView /> : <CodeMapView />}
+        {explorerMode === 'map' ? (
+          <ProjectMapView />
+        ) : coldStart ? (
+          <div className="code-map">
+            <div className="cm-stage">
+              <ColdStartGuide onSelectMode={selectMode} onExpandToPanel={expandToPanel} />
+            </div>
+          </div>
+        ) : (
+          <CodeMapView />
+        )}
         {explorerMode === 'codemap' && panelVisible ? (
           <div className="lumen-vscode-problems">
             <CodeMapProblemsView />
           </div>
         ) : null}
       </div>
+      <AiSettingsDrawer open={settingsOpen} onClose={() => setState({ settingsOpen: false })} />
       <PromptDialog />
       <Toasts />
     </div>
   )
+}
+
+
+function isAskSelection(value: unknown): value is AskSelectionPayload {
+  if (!isRecord(value) || typeof value.path !== 'string') return false
+  return typeof value.startLine === 'number' && typeof value.endLine === 'number'
+}
+
+function isExternalFocus(value: unknown): value is ExternalFocusPayload {
+  if (!isRecord(value) || !Array.isArray(value.nodes)) return false
+  return value.map === null || typeof value.map === 'string'
+}
+
+function isExternalProposal(value: unknown): value is ExternalProposalPayload {
+  return isRecord(value) && typeof value.sessionId === 'string'
 }
 
 CodeMapShell.boot = boot

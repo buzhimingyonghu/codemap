@@ -83,6 +83,26 @@ test('surfaces queue until ready, coalesce repeats, and broadcast only attached 
   hub.broadcast('codemap:changed')
   expect(sidebar.events.some((event) => event.channel === 'codemap:changed')).toBe(false)
   expect(panel.events.at(-1)).toEqual({ type: 'event', channel: 'codemap:changed', payload: undefined })
+
+  hub.detach('panel')
+  expect(hub.send('panel', { kind: 'openAiSettings' })).toBe(false)
+  expect(hub.send('panel', { kind: 'askSelection', path: '/repo/src/pay.ts', startLine: 2, endLine: 6, mode: 'adjust' })).toBe(false)
+  expect(hub.send('panel', { kind: 'externalFocus', map: null, nodes: ['order'], flow: null, note: 'queued' })).toBe(false)
+  expect(hub.send('panel', { kind: 'externalProposal', sessionId: 's1', changeSetId: 'c1' })).toBe(false)
+  const reattached = capture()
+  hub.attach('panel', reattached.post)
+  expect(hub.markReady('panel').map((action) => action.channel)).toEqual([
+    'host:openAiSettings',
+    'host:askSelection',
+    'host:externalFocus',
+    'host:externalProposal'
+  ])
+  expect(reattached.events.map((event) => event.channel)).toEqual([
+    'host:openAiSettings',
+    'host:askSelection',
+    'host:externalFocus',
+    'host:externalProposal'
+  ])
 })
 
 test('cursor follow debounces, drops duplicates, and cancels when disabled', () => {

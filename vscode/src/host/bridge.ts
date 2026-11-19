@@ -1,5 +1,6 @@
 import { homedir } from 'node:os'
 import path from 'node:path'
+import { mkdir, writeFile } from 'node:fs/promises'
 import type { CodemapLayoutPatch, CodemapLoad, CodemapNodePatch, CodemapRead, ConfirmOptions, MenuItemSpec, WorkspaceSettings } from '../../../src/shared/types'
 import {
   CodemapAccess,
@@ -27,12 +28,15 @@ export interface BridgePrompts {
   confirm(options: ConfirmOptions): Promise<number>
   quickPick(items: MenuItemSpec[]): Promise<string | null>
   warning(message: string, detail: string, allow: boolean): Promise<boolean>
+  libraryPath?(): string
 }
 
 const DEFAULT_SETTINGS: WorkspaceSettings = {
   buildCommand: '',
   debug: { program: '', args: [], cwd: '', stopOnEntry: false, preLaunchBuild: false }
 }
+
+const NEW_LIBRARY_IGNORE = ['# Code Map: folders and files listed here are not read or checked.', '.*', 'node_modules/', 'local/', 'docs/', 'todo/', ''].join('\n')
 
 export class CodeMapBridge {
   readonly access: CodemapAccess
@@ -82,6 +86,11 @@ export class CodeMapBridge {
       this.library = saved
       return this.ready(saved, 'saved')
     }
+    const configured = saved ? null : this.configuredLibrary()
+    if (configured && (await isLibrary(configured).catch(() => false))) {
+      this.library = configured
+      return this.ready(configured, 'saved')
+    }
     const candidates = await findLibraries(this.root)
     if (candidates.length === 1) {
       this.library = candidates[0]
@@ -89,6 +98,27 @@ export class CodeMapBridge {
     }
     this.library = null
     return { ...emptyLoad(candidates.length ? 'choose' : 'none'), candidates }
+  }
+
+  /** Creates `<workspace>/codemap`, marks it as a library, and loads it. */
+  async initDefaultLibrary(): Promise<CodemapLoad> {
+    if (!this.root) throw new Error('Open a folder first')
+    const folder = path.join(this.root, 'codemap')
+    await mkdir(folder, { recursive: true })
+    await writeFile(path.join(folder, '.codemapignore'), NEW_LIBRARY_IGNORE, { flag: 'wx' }).catch((error: NodeJS.ErrnoException) => {
+      if (error.code !== 'EEXIST') throw error
+    })
+    return this.useLibrary(folder)
+  }
+
+  /** The user picks (or creates) a folder; a `.codemapignore` marks it as a library. */
+  async createLibrary(folder?: string): Promise<CodemapLoad | null> {
+    const picked = folder ?? (await this.prompts.pickFolder(this.root ?? undefined))
+    if (!picked) return null
+    await mkdir(picked, { recursive: true })
+    const library = await resolveFolder(picked)
+    await writeFile(path.join(library, '.codemapignore'), NEW_LIBRARY_IGNORE, { flag: 'a' })
+    return this.useLibrary(library)
   }
 
   async useLibrary(folder: string): Promise<CodemapLoad> {
@@ -195,6 +225,12 @@ export class CodeMapBridge {
   private async ready(library: string, source: 'saved' | 'detected', candidates: string[] = []): Promise<CodemapLoad> {
     const loaded = await loadCodemap(library)
     return { status: 'ready', source, candidates, ...loaded }
+  }
+
+  private configuredLibrary(): string | null {
+    const configured = this.prompts.libraryPath?.()
+    if (!configured || !this.root) return null
+    return path.isAbsolute(configured) ? path.resolve(configured) : path.resolve(this.root, configured)
   }
 }
 

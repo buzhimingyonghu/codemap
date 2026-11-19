@@ -189,3 +189,17 @@ test('vscode i18n renames Code Map to Architecture Map without touching shared s
   expect(translate('en', 'Project Map')).toBe('Project Map')
   expect(translate('zh', 'Save')).toBe('保存')
 })
+
+test('a missing saved library falls back to codemap.libraryPath before scanning', async () => {
+  const copy = await mkdtemp(path.join(tmpdir(), 'lumen-library-path-'))
+  created.push(copy)
+  const { cp, readFile } = await import('node:fs/promises')
+  const library = path.join(copy, 'maps')
+  await cp(path.join(fixture, 'library'), library, { recursive: true })
+  const bridge = new CodeMapBridge(copy, [], { ...prompts(), libraryPath: () => 'maps' })
+  const load = await bridge.load(null)
+  expect(load.status).toBe('ready')
+  expect(load.source).toBe('saved')
+  expect(load.library).toBe(library)
+  expect(await readFile(path.join(library, '.codemapignore'), 'utf8').catch(() => '')).not.toContain('temporary')
+})

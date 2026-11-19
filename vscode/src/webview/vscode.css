@@ -259,6 +259,156 @@ body {
   display: none;
 }
 
+/* A library with zero maps has no canvas worth showing. Keep the Codemap side reachable
+   instead of hiding it behind the closed sidebar drawer. */
+.lumen-vscode.is-sidebar:not(.is-drawer-open) .cm-body:has(.cm-placeholder) {
+  grid-template-columns: 1fr;
+  grid-template-rows: minmax(0, 1fr);
+}
+
+.lumen-vscode.is-sidebar:not(.is-drawer-open) .cm-body:has(.cm-placeholder) .cm-canvas-wrap {
+  display: none;
+}
+
+.lumen-vscode.is-sidebar:not(.is-drawer-open) .cm-body:has(.cm-placeholder) .cm-side {
+  display: flex;
+  min-height: 0;
+  border-left: 0;
+  border-top: 0;
+}
+
+.lumen-vscode.is-sidebar.is-drawer-open .cm-body:has(.cm-placeholder) {
+  grid-template-rows: minmax(0, 1fr);
+}
+
+.lumen-vscode.is-sidebar.is-drawer-open .cm-body:has(.cm-placeholder) .cm-canvas-wrap {
+  display: none;
+}
+
+.cm-cold-start {
+  position: absolute;
+  inset: 0;
+  justify-content: center;
+  gap: 18px;
+  padding: 28px 20px;
+  overflow: auto;
+}
+
+.cm-cold-cards {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 280px));
+  gap: 12px;
+  width: min(640px, 100%);
+}
+
+.cm-cold-card {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 14px 16px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-lg);
+  background: var(--bg-elevated);
+  color: var(--fg-secondary);
+  text-align: left;
+}
+
+.cm-cold-card svg {
+  color: var(--accent);
+}
+
+.cm-cold-card h3 {
+  margin: 0;
+  color: var(--fg-primary);
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.cm-cold-card p {
+  margin: 0;
+  color: var(--fg-muted);
+  font-size: var(--font-size-small);
+  line-height: 1.5;
+}
+
+.cm-cold-actions {
+  flex-wrap: wrap;
+  justify-content: center;
+  max-width: 720px;
+}
+
+.ai-settings-drawer {
+  width: min(720px, calc(100vw - 32px));
+}
+
+.ai-settings-drawer .sheet-header h2 {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.ai-settings-status,
+.ai-settings-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.ai-settings-status {
+  align-items: stretch;
+}
+
+.ai-gateway,
+.ai-connection {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 10px 12px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  background: var(--bg-input);
+}
+
+.ai-gateway.is-ok,
+.ai-connection.is-ok {
+  color: var(--success);
+}
+
+.ai-gateway.is-bad,
+.ai-connection.is-bad {
+  color: var(--danger);
+}
+
+.ai-gateway-name {
+  color: var(--fg-primary);
+  font-weight: 600;
+}
+
+.ai-gateway-where,
+.ai-connection {
+  font-size: var(--font-size-small);
+}
+
+.ai-gateway-url {
+  color: var(--fg-muted);
+  overflow-wrap: anywhere;
+}
+
+.ai-connection {
+  flex-direction: row;
+  align-items: center;
+}
+
+.lumen-vscode.is-sidebar .cm-cold-cards {
+  grid-template-columns: 1fr;
+}
+
+.lumen-vscode.is-sidebar .cm-cold-actions .button {
+  width: 100%;
+}
+
 .lumen-vscode.is-sidebar.is-drawer-open .cm-body {
   grid-template-columns: 1fr;
   grid-template-rows: minmax(180px, 52%) 48%;

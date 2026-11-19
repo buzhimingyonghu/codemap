@@ -1,8 +1,8 @@
-import { LocateFixed, Map as MapIcon, Maximize2, PanelBottom, PanelLeft, PanelLeftOpen, PanelRight, Workflow } from 'lucide-react'
+import { LocateFixed, Map as MapIcon, Maximize2, PanelBottom, PanelLeft, PanelLeftOpen, PanelRight, Settings, Workflow } from 'lucide-react'
 import type { FC } from 'react'
 import { t, useLocale } from '../../../src/renderer/src/lib/i18n'
 import { liftOff } from '../../../src/renderer/src/services/projectMap'
-import { useStore } from '../../../src/renderer/src/state/store'
+import { setState, useStore } from '../../../src/renderer/src/state/store'
 import { request } from './installBridge'
 import { setVscodePrefs, useVscodePrefs } from './prefs'
 
@@ -17,6 +17,7 @@ export const VscodeTopBar: FC<{
   const explorerMode = useStore((state) => state.explorerMode)
   const workspace = useStore((state) => state.workspace)
   const mapEditorOpen = useStore((state) => state.mapEditorOpen)
+  const settingsOpen = useStore((state) => state.settingsOpen)
   const sidebar = surface === 'sidebar'
 
   const toggleFollow = () => {
@@ -72,6 +73,17 @@ export const VscodeTopBar: FC<{
       </div>
 
       <div className="lumen-vscode-topbar-side is-right">
+        <button
+          type="button"
+          className={`lumen-vscode-action${settingsOpen ? ' is-on' : ''}`}
+          aria-pressed={settingsOpen}
+          title={t('AI & CodeMap Settings')}
+          disabled={!workspace}
+          onClick={() => setState({ settingsOpen: !settingsOpen })}
+        >
+          <Settings size={13} />
+          <span>{t('Settings')}</span>
+        </button>
         <button
           type="button"
           className={`lumen-vscode-action${followCursor ? ' is-on' : ''}`}

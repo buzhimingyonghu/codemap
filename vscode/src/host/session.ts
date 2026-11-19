@@ -33,9 +33,23 @@ export type PendingHostAction =
   | { kind: 'cursor'; path: string; line: number }
   | { kind: 'snapshot'; snapshot: NavigationSnapshot }
   | { kind: 'sidebarSide'; side: SidebarSide }
+  | { kind: 'openAiSettings' }
+  | { kind: 'askSelection'; path: string; startLine: number; endLine: number; mode?: 'ask' | 'adjust' | 'require' }
+  | { kind: 'externalFocus'; map: string | null; nodes: string[]; flow?: string | null; note?: string }
+  | { kind: 'externalProposal'; sessionId: string; changeSetId?: string }
 
 export interface DeliveredHostAction {
-  channel: 'host:mode' | 'host:revealCode' | 'host:revealProject' | 'host:cursor' | 'host:snapshot' | 'host:sidebarSide'
+  channel:
+    | 'host:mode'
+    | 'host:revealCode'
+    | 'host:revealProject'
+    | 'host:cursor'
+    | 'host:snapshot'
+    | 'host:sidebarSide'
+    | 'host:openAiSettings'
+    | 'host:askSelection'
+    | 'host:externalFocus'
+    | 'host:externalProposal'
   payload: unknown
 }
 
@@ -97,12 +111,25 @@ function deliverHostAction(action: PendingHostAction): DeliveredHostAction {
   if (action.kind === 'cursor') return { channel: 'host:cursor', payload: { path: action.path, line: action.line } }
   if (action.kind === 'snapshot') return { channel: 'host:snapshot', payload: action.snapshot }
   if (action.kind === 'sidebarSide') return { channel: 'host:sidebarSide', payload: { side: action.side } }
+  if (action.kind === 'openAiSettings') return { channel: 'host:openAiSettings', payload: {} }
+  if (action.kind === 'askSelection') {
+    return {
+      channel: 'host:askSelection',
+      payload: { path: action.path, startLine: action.startLine, endLine: action.endLine, mode: action.mode }
+    }
+  }
+  if (action.kind === 'externalFocus') {
+    return { channel: 'host:externalFocus', payload: { map: action.map, nodes: action.nodes, flow: action.flow, note: action.note } }
+  }
+  if (action.kind === 'externalProposal') {
+    return { channel: 'host:externalProposal', payload: { sessionId: action.sessionId, changeSetId: action.changeSetId } }
+  }
   return { channel: 'host:revealProject', payload: { path: action.path } }
 }
 
 function enqueueHostAction(queue: PendingHostAction[], action: PendingHostAction): void {
   const previous = queue.at(-1)
-  if (previous && (action.kind === 'cursor' || action.kind === 'mode' || action.kind === 'sidebarSide') && previous.kind === action.kind) {
+  if (previous && (action.kind === 'cursor' || action.kind === 'mode' || action.kind === 'sidebarSide' || action.kind === 'openAiSettings') && previous.kind === action.kind) {
     queue[queue.length - 1] = action
     return
   }

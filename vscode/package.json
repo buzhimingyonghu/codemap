@@ -1,10 +1,14 @@
 {
   "name": "codemap",
   "displayName": "CodeMap",
-  "description": "CodeMap inside VS Code: project territory map, execution-flow code map, rising Monaco editor with native LSP, and YAML diagnostics.",
+  "description": "%codemap.description%",
   "version": "0.1.0",
   "publisher": "codemap",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/buzhimingyonghu/codemap.git"
+  },
   "engines": {
     "vscode": "^1.90.0"
   },
@@ -83,6 +87,26 @@
       {
         "command": "codemap.codemap.manageGrants",
         "title": "%codemap.codemap.manageGrants%"
+      },
+      {
+        "command": "codemap.codemap.initLibrary",
+        "title": "%codemap.codemap.initLibrary%",
+        "icon": "$(new-folder)"
+      },
+      {
+        "command": "codemap.agent.openSettings",
+        "title": "%codemap.agent.openSettings%",
+        "icon": "$(settings-gear)"
+      },
+      {
+        "command": "codemap.agent.askSelection",
+        "title": "%codemap.agent.askSelection%",
+        "icon": "$(sparkle)"
+      },
+      {
+        "command": "codemap.mcp.setup",
+        "title": "%codemap.mcp.setup%",
+        "icon": "$(plug)"
       }
     ],
     "menus": {
@@ -94,6 +118,11 @@
         {
           "command": "codemap.projectMap.reveal",
           "group": "navigation"
+        },
+        {
+          "command": "codemap.agent.askSelection",
+          "group": "navigation",
+          "when": "editorHasSelection"
         }
       ],
       "editor/title": [
@@ -111,6 +140,14 @@
           "command": "codemap.map.expand",
           "when": "view == codemap.sidebarView",
           "group": "navigation"
+        },
+        {
+          "command": "codemap.agent.openSettings",
+          "when": "view == codemap.sidebarView"
+        },
+        {
+          "command": "codemap.mcp.setup",
+          "when": "view == codemap.sidebarView"
         }
       ]
     },
@@ -125,10 +162,80 @@
         "key": "ctrl+shift+m",
         "mac": "cmd+shift+m"
       }
+    ],
+    "configuration": {
+      "title": "CodeMap",
+      "properties": {
+        "codemap.libraryPath": {
+          "type": "string",
+          "default": "",
+          "scope": "resource",
+          "markdownDescription": "%codemap.libraryPath.description%"
+        },
+        "codemap.defaultSurface": {
+          "type": "string",
+          "enum": [
+            "panel",
+            "sidebar"
+          ],
+          "default": "panel",
+          "markdownDescription": "%codemap.defaultSurface.description%"
+        },
+        "codemap.followCursor": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "%codemap.followCursor.description%"
+        },
+        "codemap.agent.maxParallel": {
+          "type": "number",
+          "minimum": 1,
+          "maximum": 8,
+          "default": 3,
+          "markdownDescription": "%codemap.agent.maxParallel.description%"
+        },
+        "codemap.mcp.enabled": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "%codemap.mcp.enabled.description%"
+        }
+      }
+    },
+    "walkthroughs": [
+      {
+        "id": "codemap.welcome",
+        "title": "%codemap.welcome.title%",
+        "description": "%codemap.welcome.description%",
+        "steps": [
+          {
+            "id": "projectMap",
+            "title": "%codemap.welcome.projectMap.title%",
+            "description": "%codemap.welcome.projectMap.description%",
+            "media": {
+              "markdown": "walkthroughs/welcome.md"
+            }
+          },
+          {
+            "id": "aiBuild",
+            "title": "%codemap.welcome.aiBuild.title%",
+            "description": "%codemap.welcome.aiBuild.description%",
+            "media": {
+              "markdown": "walkthroughs/ai-build.md"
+            }
+          },
+          {
+            "id": "externalMcp",
+            "title": "%codemap.welcome.externalMcp.title%",
+            "description": "%codemap.welcome.externalMcp.description%",
+            "media": {
+              "markdown": "walkthroughs/external-mcp.md"
+            }
+          }
+        ]
+      }
     ]
   },
   "scripts": {
-    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.webview.json --noEmit",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.extension.json --noEmit && tsc -p tsconfig.webview.json --noEmit",
     "build": "node scripts/build.mjs",
     "test": "vitest run",
     "package": "npm run build && vsce package --no-dependencies --allow-missing-repository -o codemap-0.1.0.vsix"
