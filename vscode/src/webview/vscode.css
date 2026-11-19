@@ -1,0 +1,351 @@
+html,
+body {
+  margin: 0 !important;
+  padding: 0 !important;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background: var(--bg-window);
+}
+
+#root,
+.lumen-vscode {
+  position: fixed;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  padding: 0;
+}
+
+.lumen-vscode {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+  background: var(--bg-window);
+  color: var(--fg-primary);
+}
+
+.lumen-vscode-topbar {
+  height: 34px;
+  flex: 0 0 34px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 0 8px;
+  border-bottom: 1px solid var(--border-subtle);
+  background: var(--bg-titlebar, var(--bg-panel));
+  color: var(--fg-secondary);
+}
+
+.lumen-vscode-topbar-side {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.lumen-vscode-topbar-side.is-right {
+  flex: 0 0 auto;
+  justify-content: flex-end;
+}
+
+.lumen-vscode-workspace {
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding: 2px 7px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  background: var(--bg-hover);
+  color: var(--fg-primary);
+  font: 600 11px/16px var(--font-ui);
+}
+
+.lumen-vscode-modes {
+  display: flex;
+  gap: 1px;
+  padding: 2px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, var(--bg-panel) 82%, transparent);
+}
+
+.lumen-vscode-modes button,
+.lumen-vscode-action,
+.lumen-vscode-back {
+  height: 22px;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--fg-muted);
+  font: 500 11px/1 var(--font-ui);
+  white-space: nowrap;
+}
+
+.lumen-vscode-modes button {
+  padding: 0 7px;
+}
+
+.lumen-vscode-modes button:hover:not(:disabled),
+.lumen-vscode-action:hover,
+.lumen-vscode-back:hover {
+  color: var(--fg-primary);
+  background: var(--bg-hover);
+}
+
+.lumen-vscode-modes button.is-on {
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.lumen-vscode-modes button:disabled {
+  opacity: 0.4;
+}
+
+.lumen-vscode-action,
+.lumen-vscode-back {
+  padding: 0 8px;
+  border: 1px solid var(--border-subtle);
+}
+
+.lumen-vscode-back {
+  color: var(--accent);
+}
+
+.lumen-vscode-back kbd {
+  padding: 0 4px;
+  border-radius: 3px;
+  background: var(--bg-hover);
+  color: var(--fg-secondary);
+  font: 600 9px/14px var(--font-mono);
+}
+
+.lumen-vscode-stage {
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+  display: flex;
+  position: relative;
+}
+
+.lumen-vscode-stage > .code-map,
+.lumen-vscode-stage > .project-map {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  height: 100%;
+}
+
+.lumen-vscode-problems {
+  width: 320px;
+  min-width: 240px;
+  min-height: 0;
+  border-left: 1px solid var(--border-subtle);
+  overflow: auto;
+  background: var(--bg-panel);
+}
+
+.lumen-vscode-action.is-on {
+  color: var(--accent);
+  background: var(--accent-soft);
+  border-color: color-mix(in srgb, var(--accent) 35%, var(--border-subtle));
+}
+
+
+.lumen-vscode.is-sidebar {
+  --lumen-sidebar-chrome: 34px;
+}
+
+.lumen-vscode-topbar.is-sidebar {
+  gap: 6px;
+  padding: 0 4px;
+}
+
+.lumen-vscode-topbar.is-sidebar .lumen-vscode-topbar-side {
+  gap: 4px;
+}
+
+.lumen-vscode-topbar.is-sidebar .lumen-vscode-modes button,
+.lumen-vscode-topbar.is-sidebar .lumen-vscode-action {
+  padding: 0 6px;
+}
+
+/* Narrow sidebar: the 760px rule in app.css hides .map-side. Bring it back as a foldable sheet. */
+.lumen-vscode.is-sidebar.is-drawer-open .project-map .map-side {
+  display: flex;
+  position: absolute;
+  left: 8px;
+  right: 8px;
+  bottom: 48px;
+  top: auto;
+  width: auto;
+  max-height: 52%;
+  overflow-y: auto;
+  z-index: 4;
+  pointer-events: auto;
+}
+
+.lumen-vscode.is-sidebar .project-map .map-dock {
+  bottom: 8px;
+  right: 8px;
+  transform: scale(0.92);
+  transform-origin: bottom right;
+}
+
+.lumen-vscode.is-sidebar .project-map .map-trail {
+  left: 8px;
+  top: 8px;
+  max-width: calc(100% - 16px);
+  font-size: 11px;
+}
+
+.lumen-vscode.is-sidebar.is-dock-right .lumen-vscode-topbar.is-sidebar {
+  flex-direction: row-reverse;
+}
+
+.lumen-vscode.is-sidebar.is-dock-right .lumen-vscode-topbar.is-sidebar .lumen-vscode-topbar-side.is-right {
+  flex-direction: row-reverse;
+}
+
+.lumen-vscode.is-sidebar.is-dock-right .project-map .map-dock {
+  left: 8px;
+  right: auto;
+  transform-origin: bottom left;
+}
+
+.lumen-vscode.is-sidebar.is-dock-right .project-map .map-trail {
+  left: 8px;
+  right: auto;
+  max-width: calc(100% - 28px);
+}
+
+.lumen-vscode.is-sidebar.is-dock-right .cm-canvas-actions {
+  right: auto;
+  left: 8px;
+}
+
+.lumen-vscode.is-sidebar .cm-toolbar {
+  padding: 4px 8px;
+  gap: 4px 8px;
+  min-height: 0;
+}
+
+.lumen-vscode.is-sidebar .cm-legend {
+  display: none;
+}
+
+.lumen-vscode.is-sidebar .cm-select {
+  max-width: 140px;
+}
+
+.lumen-vscode.is-sidebar:not(.is-drawer-open) .cm-body {
+  grid-template-columns: 1fr;
+  grid-template-rows: 1fr;
+}
+
+.lumen-vscode.is-sidebar:not(.is-drawer-open) .cm-canvas-wrap {
+  height: 100%;
+  min-height: 0;
+}
+
+.lumen-vscode.is-sidebar:not(.is-drawer-open) .cm-side {
+  display: none;
+}
+
+.lumen-vscode.is-sidebar.is-drawer-open .cm-body {
+  grid-template-columns: 1fr;
+  grid-template-rows: minmax(180px, 52%) 48%;
+}
+
+.lumen-vscode.is-sidebar.is-drawer-open .cm-side {
+  display: flex;
+  min-height: 0;
+  border-left: 0;
+  border-top: 1px solid var(--border-subtle);
+}
+
+@media (max-width: 560px) {
+  .lumen-vscode-workspace {
+    display: none;
+  }
+
+  .lumen-vscode-topbar {
+    gap: 4px;
+    padding: 0 4px;
+  }
+
+  .lumen-vscode-topbar-side,
+  .lumen-vscode-topbar-side.is-right {
+    gap: 4px;
+  }
+
+  .lumen-vscode-modes button span,
+  .lumen-vscode-action span,
+  .lumen-vscode-back span {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
+  }
+
+  .lumen-vscode-modes button,
+  .lumen-vscode-action,
+  .lumen-vscode-back {
+    width: 24px;
+    padding: 0;
+    justify-content: center;
+  }
+
+  .lumen-vscode-back kbd {
+    display: none;
+  }
+
+  .cm-toolbar {
+    padding: 4px 8px;
+    gap: 4px 8px;
+  }
+
+  .cm-legend {
+    display: none;
+  }
+
+  .cm-select {
+    max-width: 140px;
+  }
+
+  .lumen-vscode:not(.is-drawer-open) .cm-body {
+    grid-template-columns: 1fr;
+    grid-template-rows: 1fr;
+  }
+
+  .lumen-vscode:not(.is-drawer-open) .cm-canvas-wrap {
+    height: 100%;
+  }
+
+  .lumen-vscode:not(.is-drawer-open) .cm-side {
+    display: none;
+  }
+
+  .lumen-vscode.is-drawer-open .cm-body {
+    grid-template-columns: 1fr;
+    grid-template-rows: minmax(180px, 52%) 48%;
+  }
+
+  .lumen-vscode.is-drawer-open .cm-side {
+    display: flex;
+    border-left: 0;
+    border-top: 1px solid var(--border-subtle);
+  }
+}

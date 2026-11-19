@@ -1,0 +1,12 @@
+{
+  "codemap.map.open": "CodeMap: Open Map",
+  "codemap.sidebar.open": "CodeMap: Open in Sidebar",
+  "codemap.map.expand": "CodeMap: Open Full Map in Editor",
+  "codemap.codemap.open": "CodeMap: Open Architecture Map",
+  "codemap.projectMap.open": "CodeMap: Open Project Map",
+  "codemap.codemap.reveal": "CodeMap: Show in Architecture Map",
+  "codemap.projectMap.reveal": "CodeMap: Show in Project Map",
+  "codemap.codemap.chooseLibrary": "CodeMap: Choose Architecture Library",
+  "codemap.codemap.validate": "CodeMap: Validate Architecture Map",
+  "codemap.codemap.manageGrants": "CodeMap: Manage External Read Grants"
+}

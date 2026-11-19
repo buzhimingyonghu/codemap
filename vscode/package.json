@@ -1,0 +1,158 @@
+{
+  "name": "codemap",
+  "displayName": "CodeMap",
+  "description": "CodeMap inside VS Code: project territory map, execution-flow code map, rising Monaco editor with native LSP, and YAML diagnostics.",
+  "version": "0.1.0",
+  "publisher": "codemap",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "extensionKind": [
+    "workspace"
+  ],
+  "categories": [
+    "Visualization",
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./dist/extension.cjs",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "codemap",
+          "title": "CodeMap",
+          "icon": "media/codemap-activity.svg"
+        }
+      ]
+    },
+    "views": {
+      "codemap": [
+        {
+          "type": "webview",
+          "id": "codemap.sidebarView",
+          "name": "CodeMap"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "codemap.map.open",
+        "title": "%codemap.map.open%",
+        "icon": "$(map)"
+      },
+      {
+        "command": "codemap.sidebar.open",
+        "title": "%codemap.sidebar.open%",
+        "icon": "$(layout-sidebar-left)"
+      },
+      {
+        "command": "codemap.map.expand",
+        "title": "%codemap.map.expand%",
+        "icon": "$(screen-full)"
+      },
+      {
+        "command": "codemap.codemap.open",
+        "title": "%codemap.codemap.open%",
+        "icon": "$(type-hierarchy)"
+      },
+      {
+        "command": "codemap.projectMap.open",
+        "title": "%codemap.projectMap.open%",
+        "icon": "$(map)"
+      },
+      {
+        "command": "codemap.codemap.reveal",
+        "title": "%codemap.codemap.reveal%"
+      },
+      {
+        "command": "codemap.projectMap.reveal",
+        "title": "%codemap.projectMap.reveal%"
+      },
+      {
+        "command": "codemap.codemap.chooseLibrary",
+        "title": "%codemap.codemap.chooseLibrary%"
+      },
+      {
+        "command": "codemap.codemap.validate",
+        "title": "%codemap.codemap.validate%"
+      },
+      {
+        "command": "codemap.codemap.manageGrants",
+        "title": "%codemap.codemap.manageGrants%"
+      }
+    ],
+    "menus": {
+      "editor/context": [
+        {
+          "command": "codemap.codemap.reveal",
+          "group": "navigation"
+        },
+        {
+          "command": "codemap.projectMap.reveal",
+          "group": "navigation"
+        }
+      ],
+      "editor/title": [
+        {
+          "command": "codemap.projectMap.open",
+          "group": "navigation"
+        },
+        {
+          "command": "codemap.codemap.open",
+          "group": "navigation"
+        }
+      ],
+      "view/title": [
+        {
+          "command": "codemap.map.expand",
+          "when": "view == codemap.sidebarView",
+          "group": "navigation"
+        }
+      ]
+    },
+    "keybindings": [
+      {
+        "command": "codemap.codemap.open",
+        "key": "ctrl+shift+y",
+        "mac": "cmd+shift+y"
+      },
+      {
+        "command": "codemap.projectMap.open",
+        "key": "ctrl+shift+m",
+        "mac": "cmd+shift+m"
+      }
+    ]
+  },
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.webview.json --noEmit",
+    "build": "node scripts/build.mjs",
+    "test": "vitest run",
+    "package": "npm run build && vsce package --no-dependencies --allow-missing-repository -o codemap-0.1.0.vsix"
+  },
+  "dependencies": {
+    "js-yaml": "^4.3.2",
+    "yaml": "^2.9.1"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "@types/react": "^19.2.0",
+    "@types/react-dom": "^19.2.0",
+    "@types/vscode": "^1.90.0",
+    "@vitejs/plugin-react": "^5.2.0",
+    "@vscode/vsce": "^3.7.0",
+    "d3-voronoi-map": "^2.1.1",
+    "esbuild": "^0.25.0",
+    "lucide-react": "^1.51.0",
+    "monaco-editor": "^0.57.0",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "typescript": "~5.9.3",
+    "vite": "^7.3.6",
+    "vitest": "^5.0.3",
+    "zustand": "^5.0.15"
+  }
+}

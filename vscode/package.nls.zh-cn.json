@@ -1,0 +1,12 @@
+{
+  "codemap.map.open": "CodeMap: 打开地图",
+  "codemap.sidebar.open": "CodeMap: 在侧边栏打开",
+  "codemap.map.expand": "CodeMap: 在编辑区全屏打开",
+  "codemap.codemap.open": "CodeMap: 打开架构图",
+  "codemap.projectMap.open": "CodeMap: 打开项目地图",
+  "codemap.codemap.reveal": "CodeMap: 在架构图中显示",
+  "codemap.projectMap.reveal": "CodeMap: 在项目地图中显示",
+  "codemap.codemap.chooseLibrary": "CodeMap: 选择架构图节点库",
+  "codemap.codemap.validate": "CodeMap: 校验架构图",
+  "codemap.codemap.manageGrants": "CodeMap: 管理外部只读授权"
+}
