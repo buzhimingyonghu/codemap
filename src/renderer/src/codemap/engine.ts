@@ -127,6 +127,10 @@ export class CodeMapEngine {
   private transitioning = false
   private flowMode: FlowMode = 'focus'
   private heartbeatOn = true
+  /** Structure-map lane regions. Off hides `.cm-lanes` without dropping branch labels. */
+  private showLanes = true
+  /** Architecture edge names. Branch `when` labels stay visible when this is off. */
+  private showEdgeLabels = true
   private frozen = false
   /** Edit session open: nodes and edge ends can be dragged, nothing opens on click. */
   private editing = false
@@ -198,6 +202,7 @@ export class CodeMapEngine {
       .join('')
     let h = `<defs>${markers}</defs><g class="cm-vp">`
     const reqClass = (status: ChangeMark | null | undefined) => (V.reqOn && status ? ` req-${status}` : '')
+    const isExecMap = V.members.some((id) => V.node(id)?.kind === 'function')
     const visible = V.edges.filter(
       (e) => shown(e.status, V.reqOn) && shown(V.status.get(e.from), V.reqOn) && shown(V.status.get(e.to), V.reqOn) && L.pos.has(e.from) && L.pos.has(e.to)
     )
@@ -206,6 +211,12 @@ export class CodeMapEngine {
     this.ambient = []
     // Loop frames sit under the lines and nodes.
     this.frames = loopFrames(V.loops, L.pos)
+    h += `<g class="cm-lanes">${L.laneAreas
+      .map(
+        (l) =>
+          `<g class="cm-lane${l.dock ? ` is-dock is-dock-${l.dock}` : ''}" data-lane="${esc(l.id)}"><rect class="cm-lane-bg" x="${l.x}" y="${l.y}" width="${l.w}" height="${l.h}" rx="10"/><text class="cm-lane-title" x="${l.x + 12}" y="${l.y + 18}">${esc(fitText(l.name, Math.max(40, l.w - 24), 11))}</text></g>`
+      )
+      .join('')}</g>`
     h += `<g class="cm-loops">${this.frames.map((f) => frameMarkup(f, text.loop)).join('')}</g>`
     for (const e of visible) {
       const a = L.pos.get(e.from)!
@@ -233,8 +244,11 @@ export class CodeMapEngine {
       const when = e.data.when && e.data.when !== 'pass' ? (e.data.when === 'fail' ? text.fail : String(e.data.when)) : ''
       // A loop's back line leaves its node to the left: its condition sits under that run, right-aligned to the node.
       const back = this.frames.some((f) => f.loop.back.has(e.key)) && !edgePorts(e.data)
-      if (when && back) labels.push(`<text class="cm-elabel is-back${err ? ' err' : ''}" x="${a.x - a.w / 2 - 6}" y="${a.y + 13}">${esc(when)}</text>`)
-      else if (when) labels.push(`<text class="cm-elabel${err ? ' err' : ''}" x="${g.mid[0]}" y="${g.mid[1] - 4}">${esc(when)}</text>`)
+      const edgeName = !when && !isExecMap && e.data.name ? fitText(String(e.data.name).trim(), 92, 10) : ''
+      const label = when || edgeName
+      const labelCls = [when ? '' : 'is-edge-name', infra && !when ? 'is-infra' : '', back && when ? 'is-back' : '', err ? 'err' : ''].filter(Boolean).join(' ')
+      if (label && back && when) labels.push(`<text class="cm-elabel${labelCls ? ` ${labelCls}` : ''}" data-key="${key}" x="${a.x - a.w / 2 - 6}" y="${a.y + 13}">${esc(label)}</text>`)
+      else if (label) labels.push(`<text class="cm-elabel${labelCls ? ` ${labelCls}` : ''}" data-key="${key}" x="${g.mid[0]}" y="${g.mid[1] - 4}">${esc(label)}</text>`)
       this.ambient.push(...ambientBalls(e, err).map((ball) => ({ ...ball, infra })))
     }
     h += labels.join('')
@@ -280,6 +294,8 @@ export class CodeMapEngine {
     this.trackEls = [...this.svg.querySelectorAll<SVGGElement>('g.cm-hb')]
     this.applyFlowMode()
     this.svg.classList.toggle('no-hb', !this.heartbeatOn)
+    this.svg.classList.toggle('no-lanes', !this.showLanes)
+    this.svg.classList.toggle('no-elabels', !this.showEdgeLabels)
     this.svg.classList.toggle('is-editing', this.editing)
     this.both = new Set(visible.map((e) => `${e.from}->${e.to}`))
     this.drawPorts()
@@ -366,13 +382,14 @@ export class CodeMapEngine {
   // ---------- State shown on the canvas ----------
 
   select(key: string | null): void {
-    for (const el of this.svg.querySelectorAll('.cm-edge.sel, .cm-amb.sel')) el.classList.remove('sel')
+    for (const el of this.svg.querySelectorAll('.cm-edge.sel, .cm-amb.sel, .cm-elabel.sel')) el.classList.remove('sel')
     this.selectedEdge = key
     this.drawPorts()
     this.applyBallState()
     if (!key) return
     this.paths.get(key)?.el.classList.add('sel')
     for (const el of this.ambientEls) if (el.dataset.key === key) el.classList.add('sel')
+    for (const el of this.svg.querySelectorAll<SVGTextElement>(`text.cm-elabel[data-key="${CSS.escape(key)}"]`)) el.classList.add('sel')
   }
 
   /** Marks the played part of a flow: visited nodes, the current node, lit edges. */
@@ -433,6 +450,7 @@ export class CodeMapEngine {
       if (linked) keys.add(el.dataset.key ?? '')
     }
     for (const el of this.ambientEls) el.classList.toggle('is-linked', keys.has(el.dataset.key ?? ''))
+    for (const el of this.svg.querySelectorAll<SVGTextElement>('text.cm-elabel[data-key]')) el.classList.toggle('is-linked', keys.has(el.dataset.key ?? ''))
     this.svg.classList.toggle('has-linked', Boolean(id))
     this.linkedKeys = keys
     this.applyBallState()
@@ -477,6 +495,18 @@ export class CodeMapEngine {
     this.heartbeatOn = on
     this.svg.classList.toggle('no-hb', !on)
     this.syncLoop()
+  }
+
+  /** Shows or hides the lane regions behind a structure map. */
+  setShowLanes(on: boolean): void {
+    this.showLanes = on
+    this.svg.classList.toggle('no-lanes', !on)
+  }
+
+  /** Shows or hides architecture edge names. Branch conditions stay. */
+  setShowEdgeLabels(on: boolean): void {
+    this.showEdgeLabels = on
+    this.svg.classList.toggle('no-elabels', !on)
   }
 
   /** While the editor covers the map nothing animates. */
@@ -531,6 +561,11 @@ export class CodeMapEngine {
       entry.el.setAttribute('d', g.d)
       for (const extra of this.svg.querySelectorAll<SVGPathElement>(`path.cm-hit[data-key="${CSS.escape(e.key)}"], path.cm-edge-hint[data-key="${CSS.escape(e.key)}"]`)) {
         extra.setAttribute('d', g.d)
+      }
+      const label = this.svg.querySelector<SVGTextElement>(`text.cm-elabel[data-key="${CSS.escape(e.key)}"]`)
+      if (label && !label.classList.contains('is-back')) {
+        label.setAttribute('x', String(g.mid[0]))
+        label.setAttribute('y', String(g.mid[1] - 4))
       }
     }
   }

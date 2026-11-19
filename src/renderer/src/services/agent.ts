@@ -1,6 +1,7 @@
 import { useSyncExternalStore } from 'react'
 import yaml from 'js-yaml'
 import type { AgentChangeSet, AgentContext, AgentEndReason, AgentEvent, AgentMessageView, AgentMode, AgentPhase, AgentSessionInfo, AgentSessionSummary, AgentSettings, AgentStartRequest, AgentStepView, AgentUsageSummary, BuildLens, BuildTier } from '@shared/agent'
+import type { Issue } from '@shared/codemap/codemap.mjs'
 import { t } from '../lib/i18n'
 import { createLibrary, getCodeMap, reloadCodeMap, setNavigation, setPreview, previewId, type PreviewSet } from './codeMap'
 import { notify, reportError } from './ui'
@@ -421,6 +422,27 @@ export async function send(message: string, selected: string[] = []): Promise<vo
 /** Create mode: approve the current review gate and let the agent go on. */
 export function approveGate(): Promise<void> {
   return send(t('Approved. Continue with the next step.'))
+}
+
+/** Adjust mode: ask the assistant to fix the listed validation errors and warnings. */
+export async function fixIssuesWithAi(issues: Issue[], mapId?: string | null): Promise<void> {
+  const actionable = [
+    ...issues.filter((issue) => issue.level === 'error'),
+    ...issues.filter((issue) => issue.level === 'warn')
+  ]
+  if (state.running || !actionable.length) return
+  if (state.mode !== 'adjust') await setMode('adjust')
+  if (state.running || state.mode !== 'adjust') return
+  const shown = actionable.slice(0, 15)
+  const lines = shown.map((issue) => `- [${issue.rule}] ${issue.where}: ${issue.msg}`)
+  const rest = actionable.length - shown.length
+  if (rest > 0) lines.push(t('...and {n} more', { n: rest }))
+  const prompt = [
+    t('Fix these code map validation issues. Inspect the affected YAML and code, then propose a clean fix.'),
+    t('Do not break existing flows or nodes. If an old draft conflicts, call discard_change_set before writing a new one.'),
+    ...lines
+  ].join('\n')
+  await send(prompt, mapId ? [mapId] : [])
 }
 
 /** Adjust mode: ask for a child map of one node, switching mode first when needed. */

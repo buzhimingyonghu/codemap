@@ -118,7 +118,7 @@ import {
 import { getState, setState, useStore } from '../state/store'
 import { EditorArea } from '../workbench/EditorArea'
 import { AgentTab } from './AgentTab'
-import { agentMarks, onAgentLit } from '../services/agent'
+import { agentMarks, fixIssuesWithAi, onAgentLit, useAgent } from '../services/agent'
 
 type Detail =
   | { kind: 'node'; id: string }
@@ -318,6 +318,8 @@ function CodeMapStage({ data, frozen }: { data: CodeMapData; frozen: boolean }) 
     return saved === 'off' || saved === 'all' ? saved : 'focus'
   })
   const [heartbeatOn, setHeartbeatOn] = useState(() => localStorage.getItem('codemap.heartbeat') !== '0')
+  const [showLanes, setShowLanes] = useState(() => localStorage.getItem('codemap.showLanes') !== '0')
+  const [showEdgeLabels, setShowEdgeLabels] = useState(() => localStorage.getItem('codemap.showEdgeLabels') !== '0')
   const [size, setSize] = useState({ width: 0, height: 0 })
   const timer = useRef<number | null>(null)
   const playRef = useRef(play)
@@ -337,8 +339,11 @@ function CodeMapStage({ data, frozen }: { data: CodeMapData; frozen: boolean }) 
         return
       }
       setDetailState(next)
+      const sideList = next?.kind === 'issues' || next?.kind === 'todos'
+      if (sideList) window.dispatchEvent(new CustomEvent('codemap:openSidePanel'))
       // While talking to the assistant, picking a node only sets the context; the AI tab stays.
-      if (next && tabRef.current !== 'ai') switchTab('detail')
+      // Errors, warnings, and to-dos always open the detail tab, even from the AI chat.
+      if (next && (sideList || tabRef.current !== 'ai')) switchTab('detail')
     },
     [switchTab]
   )
@@ -482,7 +487,15 @@ function CodeMapStage({ data, frozen }: { data: CodeMapData; frozen: boolean }) 
   useEffect(() => {
     engineRef.current?.setHeartbeat(heartbeatOn)
     localStorage.setItem('codemap.heartbeat', heartbeatOn ? '1' : '0')
-  }, [heartbeatOn])
+  }, [heartbeatOn, sceneKey])
+  useEffect(() => {
+    engineRef.current?.setShowLanes(showLanes)
+    localStorage.setItem('codemap.showLanes', showLanes ? '1' : '0')
+  }, [showLanes, sceneKey])
+  useEffect(() => {
+    engineRef.current?.setShowEdgeLabels(showEdgeLabels)
+    localStorage.setItem('codemap.showEdgeLabels', showEdgeLabels ? '1' : '0')
+  }, [showEdgeLabels, sceneKey])
   useEffect(() => {
     if (!selField || !view) return engineRef.current?.trace([])
     engineRef.current?.trace(view.members.filter((id) => fieldRefs(view, id, 'writes').includes(selField)))
@@ -827,6 +840,14 @@ function CodeMapStage({ data, frozen }: { data: CodeMapData; frozen: boolean }) 
           <label className="cm-toggle" data-tooltip={t('Heartbeats')}>
             <input type="checkbox" checked={heartbeatOn} onChange={(event) => setHeartbeatOn(event.target.checked)} />
             <span>{t('Heartbeat')}</span>
+          </label>
+          <label className="cm-toggle" data-tooltip={t('Show lane regions')}>
+            <input type="checkbox" checked={showLanes} onChange={(event) => setShowLanes(event.target.checked)} />
+            <span>{t('Lanes')}</span>
+          </label>
+          <label className="cm-toggle" data-tooltip={t('Show edge labels')}>
+            <input type="checkbox" checked={showEdgeLabels} onChange={(event) => setShowEdgeLabels(event.target.checked)} />
+            <span>{t('Labels')}</span>
           </label>
           <button
             type="button"
@@ -2230,14 +2251,82 @@ function HeartbeatDetail({ view, track }: PanelProps & { track: HeartbeatTrack }
   )
 }
 
-function IssuesDetail({ issues }: PanelProps) {
+function hasToken(haystack: string, needle: string): boolean {
+  const escaped = needle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  return new RegExp(`(?:^|[\\s./:->])${escaped}(?:$|[\\s./:->])`).test(haystack)
+}
+
+/** True when a validation issue points at this map's YAML, its id, or a member on it. */
+function issueOnMap(view: MapView, issue: Issue): boolean {
+  const where = issue.where
+  const mapFile = view.modelOf(view.X).nodes.get(view.X)?.file ?? ''
+  const files = new Set<string>()
+  if (mapFile) files.add(mapFile)
+  const addFile = (id: string) => {
+    const file = view.modelOf(id).nodes.get(id)?.file
+    if (file) files.add(file)
+  }
+  addFile(view.X)
+  for (const id of view.members) addFile(id)
+  for (const edge of view.edges) {
+    addFile(edge.from)
+    addFile(edge.to)
+  }
+  for (const file of files) {
+    const stem = file.split('/').pop()?.replace(/\.ya?ml$/i, '') ?? ''
+    if (where === file || where.startsWith(`${file} `) || where.startsWith(`${file}:`)) return true
+    if (stem && (where === stem || where.startsWith(`${stem} `) || where.startsWith(`${stem}/`) || where.startsWith(`${stem}.`))) return true
+  }
+  const ids = new Set<string>([view.X, ...view.members, ...view.edges.flatMap((edge) => [edge.from, edge.to, edge.key])])
+  for (const id of ids) {
+    if (!id) continue
+    const short = id.includes('.') ? id.slice(id.lastIndexOf('.') + 1) : id
+    if (hasToken(where, id) || (short.length > 1 && hasToken(where, short))) return true
+  }
+  return false
+}
+
+function IssuesDetail({ view, issues, onTab }: PanelProps) {
   const LV: Record<string, string> = { error: t('Error'), warn: t('Warning'), info: t('Info') }
+  const agent = useAgent()
+  const onMap = useMemo(() => issues.filter((issue) => issueOnMap(view, issue)), [issues, view])
+  const mapActionable = onMap.filter((issue) => issue.level === 'error' || issue.level === 'warn').length
+  const [scope, setScope] = useState<'map' | 'all'>(mapActionable ? 'map' : 'all')
   const [showInfo, setShowInfo] = useState(false)
-  const visible = issues.filter((i) => showInfo || i.level !== 'info')
-  const infoCount = issues.length - issues.filter((i) => i.level !== 'info').length
+  const scoped = scope === 'map' ? onMap : issues
+  const visible = scoped.filter((issue) => showInfo || issue.level !== 'info')
+  const infoCount = scoped.filter((issue) => issue.level === 'info').length
+  const actionable = scoped.filter((issue) => issue.level === 'error' || issue.level === 'warn')
+  const mapCount = showInfo ? onMap.length : onMap.filter((issue) => issue.level !== 'info').length
+  const allCount = showInfo ? issues.length : issues.filter((issue) => issue.level !== 'info').length
   return (
     <>
-      <div className="cm-title">{t('Check results')}</div>
+      <div className="cm-issues-head">
+        <div className="cm-title">{t('Check results')}</div>
+        <div className="segmented cm-issue-scope" role="radiogroup" aria-label={t('Issue scope')}>
+          <button type="button" role="radio" aria-checked={scope === 'map'} className={scope === 'map' ? 'is-on' : undefined} onClick={() => setScope('map')}>
+            {t('Current map ({n})', { n: mapCount })}
+          </button>
+          <button type="button" role="radio" aria-checked={scope === 'all'} className={scope === 'all' ? 'is-on' : undefined} onClick={() => setScope('all')}>
+            {t('All ({n})', { n: allCount })}
+          </button>
+        </div>
+        {actionable.length ? (
+          <button
+            type="button"
+            className="button button--primary cm-issue-fix"
+            disabled={agent.running}
+            onClick={() => {
+              onTab('ai')
+              window.dispatchEvent(new CustomEvent('codemap:openSidePanel'))
+              void fixIssuesWithAi(actionable, view.X)
+            }}
+          >
+            {t('Fix with AI')}
+          </button>
+        ) : null}
+      </div>
+      <p className="cm-issue-caption">{t('Validation issues in node library YAML, cross-map links, and flow rules. Click an item to jump to its YAML line.')}</p>
       {infoCount ? (
         <label className="cm-toggle">
           <input type="checkbox" checked={showInfo} onChange={(event) => setShowInfo(event.target.checked)} />
@@ -2246,13 +2335,13 @@ function IssuesDetail({ issues }: PanelProps) {
       ) : null}
       {visible.length ? (
         visible.map((issue, i) => (
-          <button key={i} type="button" className="cm-issue" onClick={() => void openIssue(issue)}>
+          <button key={`${issue.level}-${issue.rule}-${issue.where}-${i}`} type="button" className="cm-issue" onClick={() => void openIssue(issue)}>
             <b className={`is-${issue.level}`}>{LV[issue.level]}</b>
             <span className="mono">[{issue.rule}]</span> {issue.where}: {issue.msg}
           </button>
         ))
       ) : (
-        <div className="cm-result">{t('Nodes and requirements have no problems')}</div>
+        <div className="cm-result">{scope === 'map' ? t('This map has no problems') : t('Nodes and requirements have no problems')}</div>
       )}
     </>
   )

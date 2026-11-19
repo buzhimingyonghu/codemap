@@ -150,12 +150,119 @@ describe('code map view model', () => {
     const layout = computeLayout(v, { width: 1200, height: 700 })
     expect(layout.pos.get('order-system.mysql')?.dock).toBeUndefined()
     expect([...layout.pos.values()].some((p) => p.dock)).toBe(false)
-    // Lanes are not drawn, so the layout has no lane boxes.
+    // The drawn regions are `laneAreas`; there is still no property named `lanes`.
     expect('lanes' in layout).toBe(false)
+    expect(layout.laneAreas.map((l) => l.id)).toEqual(expect.arrayContaining(['access', 'biz', 'infra']))
+    expect(layout.laneAreas.some((l) => l.dock)).toBe(false)
+    for (const area of layout.laneAreas) {
+      const cards = sys.lanes.find((l: { id: string }) => l.id === area.id).nodes.map((ref: string) => layout.pos.get(v.resolve(ref)!)!)
+      for (const card of cards) expect(card.y - card.h / 2).toBeGreaterThanOrEqual(area.y + 28)
+    }
     // A resource left out of every lane is reported like any other node.
     sys.lanes = sys.lanes.filter((l: { id: string }) => l.id !== 'storage')
     const missing = checkLibrary(lib2.docs, lib2.requirements, lib2.links)
     expect(missing.base.issues.some((i) => i.rule === 'lane-missing' && i.msg.includes('order-system.mysql'))).toBe(true)
+  })
+
+  it('draws named business columns and docked bands, and drops them once a layout is saved', () => {
+    const v = buildView(ctx(), 'order-system')!
+    const layout = computeLayout(v, { width: 1200, height: 700 })
+    expect('lanes' in layout).toBe(false)
+    expect(layout.laneAreas.map((l) => [l.id, l.dock ?? ''])).toEqual([
+      ['access', ''],
+      ['biz', ''],
+      ['infra', ''],
+      ['bottom', 'bottom']
+    ])
+    const storage = layout.laneAreas.find((l) => l.dock === 'bottom')!
+    expect(storage.name).toBe('存储 / 中间件')
+    for (const area of layout.laneAreas) {
+      expect(area.x).toBeGreaterThanOrEqual(layout.box.x)
+      expect(area.y).toBeGreaterThanOrEqual(layout.box.y)
+      expect(area.x + area.w).toBeLessThanOrEqual(layout.box.x + layout.box.w)
+      expect(area.y + area.h).toBeLessThanOrEqual(layout.box.y + layout.box.h)
+    }
+    for (const id of v.members) {
+      const card = layout.pos.get(id)!
+      const area = layout.laneAreas.find((l) => (card.dock ? l.dock === card.dock : !l.dock && card.x >= l.x && card.x <= l.x + l.w))!
+      expect(card.y - card.h / 2, id).toBeGreaterThanOrEqual(area.y + (area.dock ? 22 : 28))
+    }
+    const mysql = layout.pos.get('order-system.mysql')!
+    const order = layout.pos.get('order-svc')!
+    expect(mysql.y).toBeGreaterThan(order.y)
+    for (const col of layout.laneAreas.filter((l) => !l.dock)) {
+      expect(storage.y).toBeGreaterThan(col.y + col.h)
+    }
+    const savedLib = structuredClone({ docs: lib.docs, links: lib.links, requirements: lib.requirements })
+    savedLib.docs.find((d) => d.node.id === 'order-system')!.node.layout = { 'order-svc': [40, 40] }
+    const savedCheck = checkLibrary(savedLib.docs, savedLib.requirements, savedLib.links)
+    const saved = buildView({ check: savedCheck, reqIndex: 0, reqOn: false }, 'order-system')!
+    expect(computeLayout(saved, { width: 1200, height: 700 }).laneAreas).toEqual([])
+  })
+
+  it('widens structure cards for long Chinese titles without letting a docked band overlap', () => {
+    const lib2 = structuredClone({ docs: lib.docs, links: lib.links, requirements: lib.requirements })
+    const sys = lib2.docs.find((d) => d.node.id === 'order-system')!.node
+    const gateway = sys.contains.find((n: { id?: string }) => n.id === 'gateway')
+    gateway.name = '统一接入与鉴权限流网关'
+    gateway.brief = '协议转换'
+    const mq = sys.contains.find((n: { id?: string }) => n.id === 'mq')
+    mq.name = '订单事件消息队列'
+    mq.brief = 'order-events / pay-events'
+    const check2 = checkLibrary(lib2.docs, lib2.requirements, lib2.links)
+    const v = buildView({ check: check2, reqIndex: 0, reqOn: false }, 'order-system')!
+    const layout = computeLayout(v, { width: 1400, height: 800 })
+    const wide = layout.pos.get(v.members.find((member) => member.endsWith('.gateway'))!)!
+    const plain = layout.pos.get('order-svc')!
+    expect(wide.w).toBeGreaterThan(plain.w)
+    expect(wide.w).toBeGreaterThanOrEqual(146)
+    expect(wide.w).toBeLessThanOrEqual(204)
+    expect(layout.pos.get(v.members.find((member) => member.endsWith('.user'))!)!.w).toBe(wide.w)
+    expect(wide.w % 2).toBe(0)
+    const band = [...layout.pos.values()].filter((p) => p.dock === 'bottom').sort((a, b) => a.x - b.x)
+    for (let i = 1; i < band.length; i++) expect(band[i].x - band[i].w / 2).toBeGreaterThanOrEqual(band[i - 1].x + band[i - 1].w / 2)
+    const lowest = Math.max(...[...layout.pos.values()].filter((p) => !p.dock).map((p) => p.y + p.h / 2))
+    expect(Math.min(...band.map((p) => p.y - p.h / 2))).toBeGreaterThan(lowest)
+  })
+
+  it('orders a crossed two-column structure map by barycenter', () => {
+    const doc = {
+      schema: 'codemap/v1',
+      id: 'cross',
+      kind: 'component',
+      name: 'cross',
+      contains: [
+        { id: 'A', kind: 'component', name: 'A' },
+        { id: 'B', kind: 'component', name: 'B' },
+        { id: 'C', kind: 'component', name: 'C' },
+        { id: 'D', kind: 'component', name: 'D' }
+      ],
+      lanes: [
+        { id: 'left', name: 'left', nodes: ['A', 'B'] },
+        { id: 'right', name: 'right', nodes: ['C', 'D'] }
+      ],
+      edges: [
+        { from: 'A', to: 'D' },
+        { from: 'B', to: 'C' }
+      ]
+    }
+    const check2 = checkLibrary([{ file: 'cross/cross.yaml', node: doc }], [], [])
+    const v = buildView({ check: check2, reqIndex: 0, reqOn: false }, 'cross')!
+    const layout = computeLayout(v, { width: 1000, height: 600 })
+    expect(layout.pos.get('cross.A')!.x).toBeLessThan(layout.pos.get('cross.D')!.x)
+    expect(layout.pos.get('cross.D')!.y).toBeLessThan(layout.pos.get('cross.C')!.y)
+    expect(layout.pos.get('cross.A')!.y).toBeLessThan(layout.pos.get('cross.B')!.y)
+    const boxes = [...layout.pos.values()]
+    for (let i = 0; i < boxes.length; i++) {
+      for (let j = i + 1; j < boxes.length; j++) {
+        const a = boxes[i]
+        const b = boxes[j]
+        const overlaps = Math.abs(a.x - b.x) < (a.w + b.w) / 2 && Math.abs(a.y - b.y) < (a.h + b.h) / 2
+        expect(overlaps).toBe(false)
+      }
+      expect(boxes[i].x - boxes[i].w / 2).toBeGreaterThanOrEqual(layout.box.x)
+      expect(boxes[i].y - boxes[i].h / 2).toBeGreaterThanOrEqual(layout.box.y)
+    }
   })
 
   it('docks a lane marked dock: top above the business area', () => {
@@ -188,20 +295,30 @@ describe('code map view model', () => {
     const business = ['order-svc', 'inventory-svc', 'payment-svc', 'notify'].map((ref) => layout.pos.get(v.resolve(ref)!)!)
     const minX = Math.min(...business.map((p) => p.x - p.w / 2))
     const maxX = Math.max(...business.map((p) => p.x + p.w / 2))
-    for (const id of ['order-system.user', 'order-system.gateway', 'order-system.thirdpay']) {
+    const leftArea = layout.laneAreas.find((l) => l.dock === 'left')!
+    const rightArea = layout.laneAreas.find((l) => l.dock === 'right')!
+    for (const col of layout.laneAreas.filter((l) => !l.dock)) {
+      expect(leftArea.x + leftArea.w).toBeLessThan(col.x)
+      expect(rightArea.x).toBeGreaterThan(col.x + col.w)
+    }
+    for (const ref of ['user', 'gateway', 'thirdpay']) {
+      const id = v.members.find((member) => member === ref || member.endsWith(`.${ref}`))!
       const p = layout.pos.get(id)!
       expect(p.dock, id).toBe('left')
       expect(p.x + p.w / 2, id).toBeLessThan(minX)
+      expect(p.y - p.h / 2, id).toBeGreaterThanOrEqual(leftArea.y + 22)
     }
-    const registry = layout.pos.get('order-system.registry')!
+    const registry = layout.pos.get(v.members.find((member) => member.endsWith('.registry'))!)!
     expect(registry.dock).toBe('right')
     expect(registry.x - registry.w / 2).toBeGreaterThan(maxX)
+    expect(registry.y - registry.h / 2).toBeGreaterThanOrEqual(rightArea.y + 22)
     // A left band stacks top to bottom without overlaps.
     const band = [...layout.pos.values()].filter((p) => p.dock === 'left').sort((a, b) => a.y - b.y)
     for (let i = 1; i < band.length; i++) expect(band[i].y - band[i - 1].y).toBeGreaterThanOrEqual(band[i].h)
     // Lines to a side band leave from the facing side.
-    const g = edgeGeometry(layout.pos.get('order-system.gateway')!, business[0])
-    expect(g.d.startsWith(`M${layout.pos.get('order-system.gateway')!.x + layout.pos.get('order-system.gateway')!.w / 2},`)).toBe(true)
+    const gateway = layout.pos.get(v.members.find((member) => member.endsWith('.gateway'))!)!
+    const g = edgeGeometry(gateway, business[0])
+    expect(g.d.startsWith(`M${gateway.x + gateway.w / 2},`)).toBe(true)
   })
 })
 
