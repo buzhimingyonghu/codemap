@@ -17,6 +17,8 @@ export interface AgentProvider {
   keySource: 'stored' | 'local'
   /** Whether a key is available (the key itself never leaves the main process). */
   hasKey?: boolean
+  /** Which local client supplied a local gateway: Claude Code or Codex. */
+  localSource?: 'claude' | 'codex'
   /** Default model id for this provider. */
   model: string
 }

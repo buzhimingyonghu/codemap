@@ -1,11 +1,12 @@
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import path from 'node:path'
-import { app, safeStorage } from 'electron'
-import type { AgentProvider, AgentSettings } from '../../shared/agent'
-import { LOCAL_GATEWAY_ID, defaultProviders, localGateway } from './providers'
+import type { AgentProvider, AgentSettings, ProviderKind } from '../../shared/agent'
+import { electronSafeStorage, ensureElectronHost, getAgentHost, userDataDir } from './hostAdapter'
+import { LOCAL_GATEWAY_ID, callModel, defaultProviders, listModels, localGateway } from './providers'
 
 // Agent settings live next to the app state; API keys are encrypted with the macOS keychain
-// (safeStorage) and only decrypted in the main process when a request is made.
+// (safeStorage) and only decrypted when a request is made. A host adapter can supply its own
+// secret store and settings overrides. electron is loaded lazily, never at evaluation time.
 
 interface Stored extends AgentSettings {
   /** Provider id → base64 of the encrypted key. */
@@ -17,11 +18,12 @@ const DEFAULTS: Stored = { providers: defaultProviders(), activeProvider: LOCAL_
 let cached: Stored | null = null
 
 function file(): string {
-  return path.join(app.getPath('userData'), 'agent.json')
+  return path.join(userDataDir(), 'agent.json')
 }
 
 async function load(): Promise<Stored> {
   if (cached) return cached
+  await ensureElectronHost()
   try {
     const parsed = JSON.parse(await readFile(file(), 'utf8')) as Partial<Stored>
     // Older files named the local gateway differently: map it onto the current one.
@@ -40,10 +42,18 @@ async function load(): Promise<Stored> {
   return cached
 }
 
+/** Applies a host override for readers without writing it back into the cached file. */
+async function withOverride(stored: Stored): Promise<Stored> {
+  const override = await getAgentHost()?.loadSettingsOverride?.()
+  if (!override) return stored
+  return { ...stored, ...override, providers: stored.providers, keys: stored.keys, modeModels: { ...stored.modeModels, ...(override.modeModels ?? {}) } }
+}
+
 async function save(next: Stored): Promise<void> {
   cached = next
   await mkdir(path.dirname(file()), { recursive: true })
   await writeFile(file(), JSON.stringify(next, null, 2), { encoding: 'utf8', mode: 0o600 })
+  await getAgentHost()?.saveSettingsOverride?.(publicView(next))
 }
 
 function publicView(s: Stored): AgentSettings {
@@ -56,13 +66,19 @@ function publicView(s: Stored): AgentSettings {
 }
 
 export async function getAgentSettings(): Promise<AgentSettings> {
-  const s = publicView(await load())
-  // Tell the panel whether a local gateway is set up on this Mac, and where it points.
+  const s = publicView(await withOverride(await load()))
+  // Tell the panel whether a local gateway is set up, and which wire protocol it speaks.
   const local = s.providers.find((p) => p.keySource === 'local')
   if (local) {
     const gw = await localGateway()
     local.hasKey = Boolean(gw)
     local.baseUrl = gw?.baseUrl ?? ''
+    local.kind = gw?.kind ?? local.kind
+    local.localSource = gw?.source
+    if (!local.model && gw?.model) local.model = gw.model
+  }
+  for (const provider of s.providers) {
+    if (provider.keySource === 'stored' && (await getAgentHost()?.hasSecret?.(provider.id))) provider.hasKey = true
   }
   return s
 }
@@ -98,10 +114,16 @@ export async function saveAgentSettings(next: AgentSettings): Promise<AgentSetti
 export async function setProviderKey(id: string, key: string | null): Promise<AgentSettings> {
   const current = await load()
   if (!current.providers.some((p) => p.id === id)) throw new Error(`No provider ${id}`)
+  const host = getAgentHost()
+  if (host?.setSecret) {
+    await host.setSecret(id, key)
+    return getAgentSettings()
+  }
   const keys = { ...current.keys }
   if (!key) delete keys[id]
   else {
-    if (!safeStorage.isEncryptionAvailable()) throw new Error('The system keychain is not available to store the key')
+    const safeStorage = await electronSafeStorage()
+    if (!safeStorage?.isEncryptionAvailable()) throw new Error('The system keychain is not available to store the key')
     keys[id] = safeStorage.encryptString(key).toString('base64')
   }
   await save({ ...current, keys })
@@ -116,16 +138,61 @@ export async function resolveProvider(id?: string | null): Promise<{ provider: A
   let key: string | null = null
   if (provider.keySource === 'local') {
     const gw = await localGateway()
-    if (!gw) throw new Error('No local gateway on this Mac: set one up for Claude Code or Codex, or add another provider in Settings')
+    if (!gw) throw new Error('No local gateway detected (~/.claude/settings.json or ~/.codex/config.toml). Configure Claude Code / Codex or add a provider in AI Settings.')
     key = gw.token
-    provider = { ...provider, baseUrl: gw.baseUrl, model: provider.model || gw.model }
-  } else if (s.keys[provider.id]) {
-    key = safeStorage.decryptString(Buffer.from(s.keys[provider.id], 'base64'))
+    provider = { ...provider, kind: gw.kind, baseUrl: gw.baseUrl, model: provider.model || gw.model, localSource: gw.source }
+  } else {
+    key = (await getAgentHost()?.getSecret?.(provider.id)) ?? null
+    if (!key && s.keys[provider.id]) {
+      const safeStorage = await electronSafeStorage()
+      if (!safeStorage) throw new Error('The system keychain is not available to read the key')
+      key = safeStorage.decryptString(Buffer.from(s.keys[provider.id], 'base64'))
+    }
   }
   if (!key) throw new Error(`No API key for ${provider.name}: add it in Settings → AI`)
   return { provider, key }
 }
 
 export async function rawAgentSettings(): Promise<AgentSettings> {
-  return publicView(await load())
+  return publicView(await withOverride(await load()))
+}
+
+export interface ProviderConnection {
+  ok: boolean
+  model: string
+  kind: ProviderKind
+  latencyMs: number
+  message: string
+}
+
+/** Checks that the chosen provider answers, without returning the key. */
+export async function testProviderConnection(providerId?: string | null, modelOverride?: string): Promise<ProviderConnection> {
+  const started = Date.now()
+  const { provider, key } = await resolveProvider(providerId)
+  const model = modelOverride || provider.model
+  if (!model) throw new Error(`No model chosen for ${provider.name}`)
+  const latency = () => Date.now() - started
+  try {
+    const models = await listModels(provider, key)
+    if (models.length) {
+      const known = models.includes(model)
+      return { ok: known, model, kind: provider.kind, latencyMs: latency(), message: known ? `Listed ${models.length} models` : `Connected, but ${model} is not in the model list` }
+    }
+  } catch {
+    // Some gateways have no model list; a short completion is the fallback.
+  }
+  try {
+    const reply = await callModel(provider, key, {
+      model,
+      system: 'Reply with exactly OK.',
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'Reply OK' }] }],
+      tools: [],
+      maxTokens: 16
+    })
+    const text = reply.blocks.find((block): block is Extract<typeof block, { type: 'text' }> => block.type === 'text')
+    return { ok: true, model, kind: provider.kind, latencyMs: latency(), message: text?.text.trim() ? 'Model replied' : 'Model accepted the request' }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    return { ok: false, model, kind: provider.kind, latencyMs: latency(), message: message.split(key).join('[redacted]') }
+  }
 }

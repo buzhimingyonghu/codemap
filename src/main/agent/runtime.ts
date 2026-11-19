@@ -1,7 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto'
-import { mkdir, readdir, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdir, readdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import path from 'node:path'
-import { app } from 'electron'
 import yaml from 'js-yaml'
 import { stringify as toYaml } from 'yaml'
 import type { AgentChangeSet, AgentContext, AgentEndReason, AgentEvent, AgentMessageView, AgentPhase, AgentSessionInfo, AgentSessionSummary, AgentStartRequest } from '../../shared/agent'
@@ -12,6 +11,7 @@ import { rewriteNodeFile } from './rewrite'
 import { systemPrompt } from './prompts'
 import { rawAgentSettings, resolveProvider } from './settings'
 import { checkChangeSet, readLibrary, runTool, toolLabel, toolsFor, type ToolEnv } from './tools'
+import { ensureElectronHost, userDataDir } from './hostAdapter'
 
 // The built-in agent: one loop per run (model → tools → model …), sessions saved per library,
 // change sets kept until the user applies or rejects them, and parallel sub-agents in create mode.
@@ -24,19 +24,40 @@ interface Session extends AgentSessionInfo {
 
 const sessions = new Map<string, Session>()
 const running = new Map<string, AbortController>()
+/** One write at a time per session, so parallel sub-agents cannot interleave the JSON. */
+const persistQueues = new Map<string, Promise<void>>()
 
 function sessionsDir(library: string): string {
   const key = createHash('sha1').update(library).digest('hex').slice(0, 16)
-  return path.join(app.getPath('userData'), 'agent-sessions', key)
+  return path.join(userDataDir(), 'agent-sessions', key)
 }
 
 async function persist(s: Session): Promise<void> {
+  const previous = persistQueues.get(s.id) ?? Promise.resolve()
+  const write = previous.catch(() => undefined).then(() => writeSession(s))
+  const settled = write.then(
+    () => undefined,
+    () => undefined
+  )
+  persistQueues.set(s.id, settled)
+  try {
+    await write
+  } finally {
+    if (persistQueues.get(s.id) === settled) persistQueues.delete(s.id)
+  }
+}
+
+async function writeSession(s: Session): Promise<void> {
   const dir = sessionsDir(s.library)
   await mkdir(dir, { recursive: true })
-  await writeFile(path.join(dir, `${s.id}.json`), JSON.stringify(s), 'utf8')
+  const target = path.join(dir, `${s.id}.json`)
+  const temp = `${target}.tmp-${randomUUID().slice(0, 6)}`
+  await writeFile(temp, JSON.stringify(s), 'utf8')
+  await rename(temp, target)
 }
 
 export async function listSessions(library: string): Promise<AgentSessionSummary[]> {
+  await ensureElectronHost()
   const dir = sessionsDir(library)
   const out: AgentSessionSummary[] = []
   for (const name of await readdir(dir).catch(() => [] as string[])) {
@@ -54,6 +75,7 @@ export async function listSessions(library: string): Promise<AgentSessionSummary
 async function loadSession(library: string, id: string): Promise<Session> {
   const cached = sessions.get(id)
   if (cached) return cached
+  await ensureElectronHost()
   const s = JSON.parse(await readFile(path.join(sessionsDir(library), `${id}.json`), 'utf8')) as Session
   if (s.library !== library) throw new Error('This conversation belongs to another node library')
   sessions.set(id, s)
@@ -66,6 +88,7 @@ export async function getSession(library: string, id: string): Promise<AgentSess
 }
 
 export async function deleteSession(library: string, id: string): Promise<void> {
+  await ensureElectronHost()
   running.get(id)?.abort()
   sessions.delete(id)
   await rm(path.join(sessionsDir(library), `${id}.json`), { force: true })
@@ -86,7 +109,8 @@ function makeTitle(message: string): string {
   return line.length > TITLE_MAX ? `${line.slice(0, TITLE_MAX)}…` : line || 'Conversation'
 }
 
-export async function startRun(library: string, access: CodemapAccess, req: AgentStartRequest, emit: Emit): Promise<string> {
+export async function startRun(library: string, access: CodemapAccess, req: AgentStartRequest, emit: Emit, extra?: { lsp?: ToolEnv['lsp'] }): Promise<string> {
+  await ensureElectronHost()
   if (!['ask', 'adjust', 'create', 'require'].includes(req.mode)) throw new Error(`Unknown mode ${req.mode}`)
   if (!req.message?.trim()) throw new Error('Empty message')
   let s: Session
@@ -117,7 +141,7 @@ export async function startRun(library: string, access: CodemapAccess, req: Agen
   const runId = randomUUID()
   const controller = new AbortController()
   running.set(s.id, controller)
-  void runLoop(s, access, req, runId, controller, emit).finally(() => {
+  void runLoop(s, access, req, runId, controller, emit, extra?.lsp).finally(() => {
     running.delete(s.id)
     inbox.delete(s.id)
     void persist(s)
@@ -173,13 +197,26 @@ async function turnLoop(
       if (last?.role === 'user') last.content.push(...blocks)
       else history.push({ role: 'user', content: blocks })
     }
-    const answer = await callModel(ctx.provider, ctx.key, { model: ctx.model, system: ctx.system, messages: history, tools: defs.map((d) => d.spec), signal: ctx.signal })
+    let streamedInTurn = false
+    const answer = await callModel(ctx.provider, ctx.key, {
+      model: ctx.model,
+      system: ctx.system,
+      messages: compactHistory(history),
+      tools: defs.map((d) => d.spec),
+      signal: ctx.signal,
+      onTextDelta: (delta) => {
+        if (!delta) return
+        streamedInTurn = true
+        hooks.onText(delta)
+      }
+    })
     emitUsage(answer.usage.input, answer.usage.output)
     const cut = answer.stop === 'length'
     // A cut-off reply may end in a half-written tool call: keep only its text.
     const blocks = cut ? answer.blocks.filter((b) => b.type === 'text') : answer.blocks
     history.push({ role: 'assistant', content: blocks.length ? blocks : [{ type: 'text', text: '…' }] })
-    for (const b of blocks) if (b.type === 'text') hooks.onText(b.text)
+    // A live stream already delivered the text token by token. A JSON reply still arrives whole.
+    if (!streamedInTurn) for (const b of blocks) if (b.type === 'text') hooks.onText(b.text)
     const calls = blocks.filter((b) => b.type === 'tool_use') as Array<Extract<Block, { type: 'tool_use' }>>
     if (!calls.length) {
       const next = cut ? CUT_OFF : (hooks.pending?.().length ? null : hooks.nudge?.() ?? null)
@@ -213,7 +250,7 @@ async function turnLoop(
   }
 }
 
-async function runLoop(s: Session, access: CodemapAccess, req: AgentStartRequest, runId: string, controller: AbortController, emit: Emit): Promise<void> {
+async function runLoop(s: Session, access: CodemapAccess, req: AgentStartRequest, runId: string, controller: AbortController, emit: Emit, lsp?: ToolEnv['lsp']): Promise<void> {
   const settings = await rawAgentSettings()
   const reply: AgentMessageView = { role: 'assistant', text: '', steps: [], at: Date.now() }
   s.messages.push(reply)
@@ -224,8 +261,8 @@ async function runLoop(s: Session, access: CodemapAccess, req: AgentStartRequest
     if (!model) throw new Error(`No model chosen for ${provider.name}: pick one in Settings → AI`)
     const runSets = new Set<string>()
     let fixNudges = 0
-    const env = makeEnv(s, access, runId, emit, settings.maxParallel, provider, key, model, controller.signal, undefined, (id) => runSets.add(id))
-    const defs = toolsFor(s.mode)
+    const env = makeEnv(s, access, runId, emit, settings.maxParallel, provider, key, model, controller.signal, undefined, (id) => runSets.add(id), lsp)
+    const defs = toolsFor(s.mode, true, { lsp: Boolean(lsp) })
     const system = await systemPrompt(s.library, s.mode, withSources(s, req.context))
     reason = await turnLoop({ provider, key, model, system, signal: controller.signal }, s.history, defs, env, (input, output) => emit({ type: 'usage', sessionId: s.id, runId, input, output }), {
       onText: (text) => {
@@ -303,13 +340,15 @@ function makeEnv(
   model: string,
   signal: AbortSignal,
   worker?: { scope: string; workerId: string; node: string; proposed: () => void },
-  onProposed?: (id: string) => void
+  onProposed?: (id: string) => void,
+  lsp?: ToolEnv['lsp']
 ): ToolEnv {
   const scope = worker?.scope
   return {
     library: s.library,
     access,
     mode: s.mode === 'create' || !worker ? s.mode : 'create',
+    lsp,
     focus: (map, nodes, flow, note) => {
       // A sub-agent lights up nodes too, but does not move the map away from the main agent.
       if (worker) emit({ type: 'worker-step', sessionId: s.id, runId, workerId: worker.workerId, node: worker.node, label: note ?? '', lit: nodes, note: true })
@@ -333,14 +372,14 @@ function makeEnv(
         const summary = input.summary || old.summary
         if (old.status === 'rejected') {
           // The user rejected that version: carry its content into a fresh proposal instead of failing.
-          set = { title: input.title || old.title, summary, files, changes, requirement: input.requirement ?? old.requirement, id: randomUUID().slice(0, 8), sessionId: s.id, problems: checkChangeSet(s.library, { files, changes }), status: 'proposed', replaces: old.id }
+          set = { title: input.title || old.title, summary, files, changes, requirement: input.requirement ?? old.requirement, id: randomUUID().slice(0, 8), sessionId: s.id, problems: checkChangeSet(s.library, { files, changes }, peerProposals(s, old.id)), status: 'proposed', replaces: old.id }
           s.changeSets.push(set)
         } else {
-          Object.assign(old, { files, changes, summary, problems: checkChangeSet(s.library, { files, changes }) })
+          Object.assign(old, { files, changes, summary, problems: checkChangeSet(s.library, { files, changes }, peerProposals(s, old.id)) })
           set = old
         }
       } else {
-        set = { ...input, id: randomUUID().slice(0, 8), sessionId: s.id, problems: checkChangeSet(s.library, input), status: 'proposed' }
+        set = { ...input, id: randomUUID().slice(0, 8), sessionId: s.id, problems: checkChangeSet(s.library, input, peerProposals(s)), status: 'proposed' }
         s.changeSets.push(set)
       }
       emit({ type: 'changeset', sessionId: s.id, runId, changeSet: set })
@@ -366,7 +405,7 @@ function makeEnv(
               const workerId = randomUUID().slice(0, 6)
               emit({ type: 'worker', sessionId: s.id, runId, workerId, node: t.node, state: 'running' })
               try {
-                const report = await runSubAgent(s, access, t.node, t.instructions, runId, workerId, emit, provider, key, model, signal)
+                const report = await runSubAgent(s, access, t.node, t.instructions, runId, workerId, emit, provider, key, model, signal, lsp)
                 reports.push(`## ${t.node}\n${report}`)
                 emit({ type: 'worker', sessionId: s.id, runId, workerId, node: t.node, state: signal.aborted ? 'stopped' : 'done' })
               } catch (error) {
@@ -411,15 +450,16 @@ async function runSubAgent(
   provider: Awaited<ReturnType<typeof resolveProvider>>['provider'],
   key: string,
   model: string,
-  signal: AbortSignal
+  signal: AbortSignal,
+  lsp?: ToolEnv['lsp']
 ): Promise<string> {
   const lib = readLibrary(s.library, true)
   const entry = lib.model.nodes.get(node)
   const scope = entry ? path.dirname(entry.file) : node.split('.').join('/')
   let proposed = 0
   const mine = new Set<string>()
-  const env = makeEnv(s, access, runId, emit, 1, provider, key, model, signal, { scope, workerId, node, proposed: () => proposed++ }, (id) => mine.add(id))
-  const defs = toolsFor('create', false).filter((d) => d.spec.name !== 'review_gate')
+  const env = makeEnv(s, access, runId, emit, 1, provider, key, model, signal, { scope, workerId, node, proposed: () => proposed++ }, (id) => mine.add(id), lsp)
+  const defs = toolsFor('create', false, { lsp: Boolean(lsp) }).filter((d) => d.spec.name !== 'review_gate')
   const system = await systemPrompt(s.library, 'create', { stack: [], selected: [node], flow: null }, SUB_AGENT(node, scope))
   const history: Message[] = [{ role: 'user', content: [{ type: 'text', text: instructions }] }]
   let report = ''
@@ -439,11 +479,92 @@ async function runSubAgent(
       if (!proposed) return 'You have not proposed any file yet. Do the work now with tools: read the code you need, then call propose_change_set with the map for this node (one or two files per call). Do not describe a plan.'
       const broken = s.changeSets.filter((c) => c.status === 'proposed' && mine.has(c.id) && c.problems.some((p) => p.level === 'error'))
       return broken.length ? BROKEN(broken) : null
+    },
+    after: () => {
+      s.updatedAt = Date.now()
+      void persist(s)
     }
   })
   if (reason === 'stopped') return 'Stopped.'
   if (!proposed) return (report || 'No report.') + '\n(This sub-agent proposed no files.)'
   return report || 'No report.'
+}
+
+/** Other unapplied proposals in this session. The set being replaced is not one of its own peers. */
+function peerProposals(s: Session, exceptId?: string): Array<Pick<AgentChangeSet, 'changes' | 'files'>> {
+  return s.changeSets.filter((set) => set.status === 'proposed' && set.id !== exceptId).map((set) => ({ changes: set.changes, files: set.files }))
+}
+
+const COMPACT_AT = 140_000
+const COMPACT_TOOL = 1200
+
+/** Shrinks old tool output before a model call. The stored history is left unchanged. */
+export function compactHistory(history: Message[]): Message[] {
+  const size = history.reduce((sum, message) => sum + message.content.reduce((inner, block) => inner + ('text' in block ? block.text.length : 'content' in block ? block.content.length : JSON.stringify(block).length), 0), 0)
+  const oversized = history.filter((message) => message.content.some((block) => block.type === 'tool_result' && block.content.length > COMPACT_TOOL)).length
+  if ((size <= COMPACT_AT && oversized < 3) || history.length <= 6) return history
+  const keep = history.length - 4
+  return history.map((message, index) => {
+    if (index >= keep) return message
+    let changed = false
+    const content = message.content.map((block) => {
+      if (block.type !== 'tool_result' || block.content.length <= COMPACT_TOOL) return block
+      changed = true
+      return { ...block, content: block.content.slice(0, 600) + '\n... [earlier tool output compacted; call read tool again if needed]' }
+    })
+    return changed ? { ...message, content } : message
+  })
+}
+
+function sanitizeProposalFiles(files: Record<string, string> | undefined): Record<string, string> {
+  const clean: Record<string, string> = {}
+  if (!files) return clean
+  for (const [key, value] of Object.entries(files)) {
+    const normalized = path.normalize(key).replace(/^[/\\]+/, '')
+    if (!normalized || normalized.startsWith('..') || path.isAbsolute(key)) {
+      throw new Error(`Refusing file path outside the library: ${key}`)
+    }
+    clean[normalized.split(path.sep).join('/')] = String(value)
+  }
+  return clean
+}
+
+/**
+ * Registers a proposal made outside the chat (an MCP tool, for example) in its own session,
+ * so the user can Apply or Reject it from the panel.
+ */
+export async function injectExternalProposal(
+  library: string,
+  proposal: Omit<AgentChangeSet, 'id' | 'sessionId' | 'problems' | 'status'>,
+  emit?: (event: AgentEvent) => void
+): Promise<{ sessionId: string; changeSet: AgentChangeSet }> {
+  await ensureElectronHost()
+  const cleanFiles = sanitizeProposalFiles(proposal.files)
+  const normalizedProposal = { ...proposal, files: cleanFiles }
+  const session: Session = {
+    id: randomUUID(),
+    library,
+    mode: proposal.requirement ? 'require' : 'adjust',
+    title: proposal.title || 'External proposal',
+    updatedAt: Date.now(),
+    messages: [],
+    changeSets: [],
+    history: [],
+    gate: null
+  }
+  const changeSet: AgentChangeSet = {
+    ...normalizedProposal,
+    id: randomUUID().slice(0, 8),
+    sessionId: session.id,
+    problems: checkChangeSet(library, normalizedProposal),
+    status: 'proposed'
+  }
+  session.changeSets.push(changeSet)
+  sessions.set(session.id, session)
+  await persist(session)
+  emit?.({ type: 'session', sessionId: session.id, mode: session.mode, title: session.title })
+  emit?.({ type: 'changeset', sessionId: session.id, runId: 'external', changeSet })
+  return { sessionId: session.id, changeSet }
 }
 
 // ---------- Applying change sets ----------
