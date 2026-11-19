@@ -381,6 +381,10 @@ body {
   color: var(--danger);
 }
 
+.ai-gateway.is-active {
+  border-color: var(--accent);
+}
+
 .ai-gateway-name {
   color: var(--fg-primary);
   font-weight: 600;

@@ -21,7 +21,8 @@ const LOCAL_GATEWAY_ID = 'local-gateway'
 
 export const AiSettingsDrawer: FC<{ open: boolean; onClose(): void }> = function AiSettingsDrawer({ open, onClose }) {
   useLocale()
-  const settings = useAgent().settings
+  const agent = useAgent()
+  const settings = agent.settings
   const [testing, setTesting] = useState(false)
   const [result, setResult] = useState<ConnectionResult | null>(null)
   const [connecting, setConnecting] = useState(false)
@@ -49,7 +50,7 @@ export const AiSettingsDrawer: FC<{ open: boolean; onClose(): void }> = function
     setTesting(true)
     setResult(null)
     try {
-      const next = await request<ConnectionResult>('agent:testConnection', [])
+      const next = await request<ConnectionResult>('agent:testConnection', [agent.providerId || settings?.activeProvider || null, agent.model || undefined])
       setResult(next)
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
@@ -72,8 +73,10 @@ export const AiSettingsDrawer: FC<{ open: boolean; onClose(): void }> = function
     }
   }
 
-  const local = settings?.providers.find((provider) => provider.id === LOCAL_GATEWAY_ID || provider.keySource === 'local')
-  const origin: GatewayOrigin = local?.localSource ?? (local?.hasKey ? 'unknown' : 'none')
+  const locals = settings?.providers.filter((provider) => provider.keySource === 'local') ?? []
+  const activeProviderId = agent.providerId || settings?.activeProvider || ''
+  const tested = settings?.providers.find((provider) => provider.id === activeProviderId)
+  const testedLabel = tested ? (tested.keySource === 'local' ? gatewayName(tested) : tested.name) : undefined
 
   return (
     <div className="overlay overlay--center ai-settings-overlay" onMouseDown={onClose}>
@@ -96,12 +99,16 @@ export const AiSettingsDrawer: FC<{ open: boolean; onClose(): void }> = function
         <div className="sheet-body">
           <section className="field-group ai-settings-status">
             <h3>{t('Gateway status')}</h3>
-            <GatewayStatus local={local} origin={origin} />
+            {locals.length ? (
+              locals.map((provider) => <GatewayStatus key={provider.id} local={provider} active={provider.id === activeProviderId} />)
+            ) : (
+              <span className="field-hint">{t('No local gateway provider is configured.')}</span>
+            )}
             <div className="ai-settings-actions">
               <button type="button" className="button button--primary" disabled={testing} onClick={() => void test()}>
                 {testing ? t('Testing connection…') : t('Test Connection')}
               </button>
-              {result ? <ConnectionStatus result={result} /> : null}
+              {result ? <ConnectionStatus result={result} provider={testedLabel} model={agent.model || tested?.model} /> : null}
             </div>
           </section>
 
@@ -127,8 +134,14 @@ export const AiSettingsDrawer: FC<{ open: boolean; onClose(): void }> = function
   )
 }
 
-function GatewayStatus({ local, origin }: { local: AgentProvider | undefined; origin: GatewayOrigin }) {
-  if (!local) return <span className="field-hint">{t('No local gateway provider is configured.')}</span>
+function gatewayName(local: AgentProvider): string {
+  if (local.localSource === 'claude' || local.id === LOCAL_GATEWAY_ID) return t('Claude Code Gateway')
+  if (local.localSource === 'codex' || local.id === 'local-codex') return t('Codex / Magpie Gateway')
+  return t('Local gateway')
+}
+
+function GatewayStatus({ local, active }: { local: AgentProvider; active: boolean }) {
+  const origin: GatewayOrigin = local.localSource ?? (local.hasKey ? 'unknown' : 'none')
   const detected = origin === 'claude' || origin === 'codex'
   const connected = Boolean(local.hasKey) || detected
   const protocol = local.kind === 'openai' ? 'OpenAI' : 'Anthropic'
@@ -142,21 +155,22 @@ function GatewayStatus({ local, origin }: { local: AgentProvider | undefined; or
           : t('Local gateway not found')
   const status = local.hasKey ? `${where} · ${protocol}` : where
   return (
-    <div className={`ai-gateway${connected ? ' is-ok' : ' is-bad'}`}>
-      <span className="ai-gateway-name">{t('Local gateway')}</span>
+    <div className={`ai-gateway${connected ? ' is-ok' : ' is-bad'}${active ? ' is-active' : ''}`}>
+      <span className="ai-gateway-name">{gatewayName(local)}</span>
       <span className="ai-gateway-where">{status}</span>
       {local.baseUrl ? <span className="mono ai-gateway-url">{local.baseUrl}</span> : null}
     </div>
   )
 }
 
-function ConnectionStatus({ result }: { result: ConnectionResult }) {
+function ConnectionStatus({ result, provider, model }: { result: ConnectionResult; provider?: string; model?: string }) {
   if (result.ok) {
-    const model = result.model ? ` · ${result.model}` : ''
+    const answered = [provider, result.model || model].filter(Boolean).join(' · ')
+    const detail = answered ? ` · ${answered}${result.kind ? ` (${result.kind})` : ''}` : ''
     return (
       <span className="ai-connection is-ok" role="status">
         {t('Connected · {ms}ms', { ms: result.latencyMs })}
-        {model}
+        {detail}
       </span>
     )
   }
