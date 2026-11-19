@@ -1,4 +1,4 @@
-import { cpSync, mkdtempSync } from 'node:fs'
+import { cpSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
@@ -8,20 +8,26 @@ import { describe, expect, it, vi } from 'vitest'
 const userData = mkdtempSync(path.join(tmpdir(), 'codemap-loop-'))
 vi.mock('electron', () => ({ app: { getPath: () => userData, isPackaged: false, getAppPath: () => process.cwd() }, safeStorage: { isEncryptionAvailable: () => false } }))
 
-type Req = { system: string; messages: Array<{ role: string; content: any[] }> }
+type Req = { system: string; messages: Array<{ role: string; content: any[] }>; onTextDelta?: (delta: string) => void }
 type Reply = { blocks: any[]; stop: string }
 let script: (req: Req, n: number) => Promise<Reply> | Reply = () => ({ blocks: [], stop: 'end' })
 let calls = 0
 vi.mock('../../src/main/agent/providers', async (orig) => ({
   ...(await orig<typeof import('../../src/main/agent/providers')>()),
-  callModel: async (_p: unknown, _k: unknown, req: Req) => ({ ...(await script(req, calls++)), usage: { input: 1, output: 1 } })
+  callModel: async (_p: unknown, _k: unknown, req: Req) => {
+    const reply = await script(req, calls++)
+    const usage = (reply as { usage?: { input: number; output: number } }).usage ?? { input: 1, output: 1 }
+    return { ...reply, usage }
+  }
 }))
 vi.mock('../../src/main/agent/settings', () => ({
   rawAgentSettings: async () => ({ providers: [], activeProvider: 'x', modeModels: {}, maxParallel: 2 }),
   resolveProvider: async () => ({ provider: { id: 'x', name: 'x', kind: 'anthropic', baseUrl: 'http://x', keySource: 'stored', model: 'm' }, key: 'k' })
 }))
 
-const { getSession, startRun, stopRun } = await import('../../src/main/agent/runtime')
+const runtime = await import('../../src/main/agent/runtime')
+const { compactHistory, getSession, startRun, stopRun } = runtime
+const { scanRepoEntrypoints } = await import('../../src/main/agent/repoScanner')
 
 function library(): { library: string; access: never } {
   const dir = mkdtempSync(path.join(tmpdir(), 'codemap-loop-lib-'))
@@ -251,4 +257,189 @@ describe('agent run loop', () => {
     const s = await getSession(lib.library, id)
     expect(s.messages[s.messages.length - 1].end).toBe('stopped')
   })
+
+  it('concatenates streamed deltas within a turn and separates turns with a paragraph break', async () => {
+    calls = 0
+    script = (req, n) => {
+      if (n === 0) {
+        for (const ch of ['根', '图', '的', '连', '线和', '流程', '是', '空', '的', '，']) req.onTextDelta?.(ch)
+        return { blocks: [text('根图的连线和流程是空的，'), tool('map_overview', {})], stop: 'tool' }
+      }
+      for (const ch of ['我', '先', '补', 'L0']) req.onTextDelta?.(ch)
+      return { blocks: [text('我先补L0')], stop: 'end' }
+    }
+    const lib = library()
+    const r = run('ask', 'check root', lib)
+    const id = await r.id
+    expect(await r.done).toBe('end')
+    const textEvents = r.events.filter((e) => e.type === 'text')
+    let rendered = ''
+    for (const ev of textEvents) {
+      rendered = ev.append ? rendered + ev.text : rendered ? rendered + '\n\n' + ev.text : ev.text
+    }
+    expect(rendered).toBe('根图的连线和流程是空的，\n\n我先补L0')
+    const s = await getSession(lib.library, id)
+    expect(s.messages[s.messages.length - 1].text).toBe('根图的连线和流程是空的，\n\n我先补L0')
+  })
+
+  it('discards a broken draft with discard_change_set and then allows the review gate', async () => {
+    calls = 0
+    const bad = ['schema: codemap/v1', 'id: warehouse-system.wms', 'kind: component', 'name: 仓储服务', 'contains:', '  - { id: a, kind: function, name: A }'].join('\n')
+    const seen: string[] = []
+    script = (req, n) => {
+      seen.push(lastContent(req))
+      if (n === 0) return { blocks: [tool('propose_change_set', { title: 'broken wms', summary: 's', files: { 'warehouse-system/wms/wms.yaml': bad } })], stop: 'tool' }
+      if (n === 1) {
+        const id = /Proposal (\w+)/.exec(seen[1])![1]
+        return { blocks: [tool('discard_change_set', { id, reason: 'unfixable draft' })], stop: 'tool' }
+      }
+      if (n === 2) return { blocks: [tool('review_gate', { stage: 'Blueprint', summary: 'clean' })], stop: 'tool' }
+      return { blocks: [text('ok')], stop: 'end' }
+    }
+    const r = run('create', 'go')
+    expect(await r.done).toBe('gate')
+    expect(seen[2]).toContain('Library YAML files were untouched')
+    expect(seen[2]).not.toContain('still have checker errors')
+    expect(r.events.some((e) => e.type === 'changeset-discarded')).toBe(true)
+    expect(r.events.some((e) => e.type === 'gate')).toBe(true)
+  })
+
+  it('replaces earlier changes when extend sets replaceChanges', async () => {
+    calls = 0
+    const seen: string[] = []
+    script = (req, n) => {
+      if (n > 0) seen.push(lastContent(req))
+      if (n === 0) return { blocks: [tool('propose_change_set', { title: 'rename', summary: 'first', changes: [{ modify: 'node', id: 'order-svc.save', set: { name: '保存A' } }] })], stop: 'tool' }
+      if (n === 1) {
+        const id = /Proposal (\w+)/.exec(seen[0])![1]
+        return { blocks: [tool('propose_change_set', { title: 'rename', summary: 'replaced', extend: id, replaceChanges: true, changes: [{ modify: 'node', id: 'order-svc.save', set: { name: '保存B' } }] })], stop: 'tool' }
+      }
+      return { blocks: [text('done')], stop: 'end' }
+    }
+    const r = run('create', 'rename save')
+    expect(await r.done).toBe('end')
+    const last = r.events.filter((e) => e.type === 'changeset').pop().changeSet
+    expect(last.changes).toEqual([{ modify: 'node', id: 'order-svc.save', set: { name: '保存B' } }])
+  })
+
+  it('passes saved repos, build tier, and lens into a sub-agent', async () => {
+    calls = 0
+    const systems: string[] = []
+    script = (req) => {
+      systems.push(req.system)
+      if (!req.system.includes('You are a sub-agent')) {
+        if (!has(req, (b) => b.type === 'tool_use' && b.name === 'delegate_nodes')) return { blocks: [tool('delegate_nodes', { tasks: [{ node: 'order-svc', instructions: 'break down order-svc' }] })], stop: 'tool' }
+        return { blocks: [text('main done')], stop: 'end' }
+      }
+      if (!has(req, (b) => b.type === 'tool_use' && b.name === 'propose_change_set')) return { blocks: [tool('propose_change_set', { title: 'order-svc map', summary: 's', files: { 'order-svc/notes.md': '# x' } })], stop: 'tool' }
+      return { blocks: [text('drew order-svc')], stop: 'end' }
+    }
+    const lib = library()
+    const events: any[] = []
+    let resolve!: (reason: string) => void
+    const done = new Promise<string>((r) => (resolve = r))
+    await startRun(
+      lib.library,
+      lib.access,
+      { mode: 'create', message: 'build', context: { stack: [], selected: [], flow: null, repos: ['/repo/order-svc'], buildTier: 'fast', buildLens: 'troubleshoot' } },
+      (e) => {
+        events.push(e)
+        if (e.type === 'done') resolve(e.reason)
+      }
+    )
+    expect(await done).toBe('end')
+    const sub = systems.find((system) => system.includes('You are a sub-agent'))
+    expect(sub).toContain('/repo/order-svc')
+    expect(sub).toContain('Build tier: fast')
+    expect(sub).toContain('Build lens: troubleshoot')
+  })
+
+  it('keeps contextTokens on the latest main turn and does not add sub-agent usage into it', async () => {
+    calls = 0
+    script = (req) => {
+      const worker = req.system.includes('You are a sub-agent')
+      const usage = worker ? { input: 4000, output: 300 } : { input: 120, output: 10 }
+      if (!worker) {
+        if (!has(req, (b) => b.type === 'tool_use' && b.name === 'delegate_nodes')) return { blocks: [tool('delegate_nodes', { tasks: [{ node: 'order-svc', instructions: 'break down' }] })], stop: 'tool', usage }
+        return { blocks: [text('main done')], stop: 'end', usage }
+      }
+      if (!has(req, (b) => b.type === 'tool_use' && b.name === 'propose_change_set')) return { blocks: [tool('propose_change_set', { title: 'order-svc map', summary: 's', files: { 'order-svc/notes.md': '# x' } })], stop: 'tool', usage }
+      return { blocks: [text('drew')], stop: 'end', usage }
+    }
+    const lib = library()
+    const events: any[] = []
+    let resolve!: (reason: string) => void
+    const done = new Promise<string>((r) => (resolve = r))
+    const id = await startRun(lib.library, lib.access, { mode: 'create', message: 'build', context: { stack: [], selected: [], flow: null, repos: ['/repo/order-svc'] } }, (e) => {
+      events.push(e)
+      if (e.type === 'done') resolve(e.reason)
+    })
+    expect(await done).toBe('end')
+    const usage = events.filter((e) => e.type === 'usage')
+    const main = usage.filter((e) => !e.isWorker)
+    const workers = usage.filter((e) => e.isWorker)
+    expect(main.at(-1).contextTokens).toBe(120)
+    expect(workers.every((e) => e.contextTokens === 120 || e.contextTokens === 0)).toBe(true)
+    expect(workers.reduce((sum, e) => sum + e.input, 0)).toBeGreaterThan(120)
+    const session = await getSession(lib.library, id)
+    expect(session.usage?.contextTokens).toBe(120)
+    expect(session.usage?.totalInput).toBe(240)
+    expect((session.usage?.workerInput ?? 0) > 0).toBe(true)
+    expect((session.usage?.contextTokens ?? 0) < 1000).toBe(true)
+  })
+
+  it('scans repository entrypoints and keeps a pinned scan in compacted history', async () => {
+    const root = mkdtempSync(path.join(tmpdir(), 'codemap-scan-'))
+    const { mkdirSync, writeFileSync } = await import('node:fs')
+    mkdirSync(path.join(root, '.git'), { recursive: true })
+    mkdirSync(path.join(root, 'handler'), { recursive: true })
+    writeFileSync(path.join(root, '.git', 'config'), '[remote "origin"]\n\turl = git@git.example.com:shop/order.git\n')
+    writeFileSync(path.join(root, 'go.mod'), 'module example.com/order\n\ngo 1.22\n')
+    writeFileSync(path.join(root, 'handler', 'http.go'), 'package handler\nfunc Register(r *mux) { r.GET("/orders", nil) }\n')
+    writeFileSync(path.join(root, 'handler', 'mq.go'), 'package handler\nfunc Start() { consumer.Consume("orders") }\nfunc tick() { time.NewTicker(time.Second) }\nfunc db() { db.NewOrderClient() }\n')
+    const lib = library()
+    const report = await scanRepoEntrypoints(root, lib.library, 'order-svc')
+    expect(report.startsWith('[PINNED_REPO_SCAN]')).toBe(true)
+    expect(report).toContain('git@git.example.com:shop/order.git')
+    expect(report).toContain('handler/http.go')
+    expect(report).toContain('handler/mq.go')
+    expect(report).toContain('Consume')
+    expect(report).toContain('NewTicker')
+    expect(report).toContain('NewOrderClient')
+    const big = '[PINNED_REPO_SCAN]\n' + 'entrypoint line\n'.repeat(400)
+    const history = Array.from({ length: 7 }, (_, index) => ({
+      role: index % 2 === 0 ? ('user' as const) : ('assistant' as const),
+      content: index < 3 ? [{ type: 'tool_result' as const, id: 't' + index, content: index === 0 ? big : 'x'.repeat(1500) }] : [{ type: 'text' as const, text: 'short' }]
+    }))
+    const compact = compactHistory(history)
+    const pinned = (compact[0].content[0] as { content: string }).content
+    expect(pinned.startsWith('[PINNED_REPO_SCAN]')).toBe(true)
+    expect(pinned.length).toBeGreaterThan(2000)
+    expect((compact[2].content[0] as { content: string }).content.length).toBeLessThan(800)
+  })
+
+  it('discards an unapplied proposal and refuses an applied one', async () => {
+    const lib = library()
+    writeFileSync(path.join(lib.library, 'keep.yaml'), 'id: keep')
+    calls = 0
+    const bad = 'schema: codemap/v1\nid: warehouse-system.wms\nkind: component\nname: Wms\ncontains:\n  - { id: a, kind: function, name: A }'
+    script = (req, n) => {
+      if (n === 0) return { blocks: [tool('propose_change_set', { title: 'broken wms', summary: 's', files: { 'warehouse-system/wms/wms.yaml': bad } })], stop: 'tool' }
+      if (n === 1) {
+        const id = /Proposal (\w+)/.exec(JSON.stringify(req.messages))![1]
+        return { blocks: [tool('discard_change_set', { id, reason: 'unfixable' })], stop: 'tool' }
+      }
+      return { blocks: [text('clean')], stop: 'end' }
+    }
+    const first = run('create', 'draft', lib)
+    expect(await first.done).toBe('end')
+    expect(first.events.some((event) => event.type === 'changeset-discarded')).toBe(true)
+    expect(readFileSync(path.join(lib.library, 'keep.yaml'), 'utf8')).toBe('id: keep')
+    const id = await first.id
+    expect((await getSession(lib.library, id)).changeSets).toEqual([])
+
+
+  })
+
 })
+

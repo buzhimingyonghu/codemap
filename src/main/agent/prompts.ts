@@ -1,7 +1,8 @@
-import { readdir, readFile } from 'node:fs/promises'
+import { access, readdir, readFile } from 'node:fs/promises'
 import path from 'node:path'
-import type { AgentContext, AgentMode } from '../../shared/agent'
+import type { AgentContext, AgentMode, BuildLens, BuildTier } from '../../shared/agent'
 import { knowledgeRoot } from './knowledge'
+import { readGitRemote } from './repoScanner'
 
 // System prompts. The built-in part only fixes the ground rules (tools, change sets, the map);
 // how each mode works in detail comes from the knowledge folder that ships with the app
@@ -63,18 +64,78 @@ export async function knowledgeFor(mode: AgentMode, root = knowledgeRoot()): Pro
   return parts.join('\n\n')
 }
 
+async function readIfPresent(file: string): Promise<string> {
+  try {
+    await access(file)
+  } catch {
+    return ''
+  }
+  return (await readFile(file, 'utf8').catch(() => '')).trim()
+}
+
+function tierGuide(tier: BuildTier | undefined): string {
+  const chosen = tier ?? 'balanced'
+  if (chosen === 'fast') {
+    return [
+      'Build tier: fast.',
+      'Call scan_repo_entrypoints first so no entrypoint is missed. Do NOT call review_gate (0 pauses).',
+      'Build the L0 map and the L1 module skeleton maps, plus a root docs/<id>.md, directly. Validate until the checker reports 0 errors, then finish with an entry-coverage summary.'
+    ].join('\n')
+  }
+  if (chosen === 'deep') {
+    return [
+      'Build tier: deep.',
+      'Full stage-by-stage workflow: scan_repo_entrypoints, then a Blueprint review_gate, then an L0 review_gate, then parallel delegate_nodes with an L1 review_gate, then L2/L3 functions and code branches.'
+    ].join('\n')
+  }
+  return [
+    'Build tier: balanced.',
+    'Call scan_repo_entrypoints first. Present one compact Structured Blueprint Table (Modules/Services, Sync/Async/Timer entrypoints, Storage, Flows, Open Questions) and pause once at review_gate with stage "Blueprint" (or "蓝图对齐").',
+    'After the user approves, build the complete L0 and L1 maps, with links.yaml for key cross-service edges and a module docs/<id>.md, and do not stop at further intermediate gates until that build is done.'
+  ].join('\n')
+}
+
+function lensGuide(lens: BuildLens | undefined): string {
+  const chosen = lens ?? 'service'
+  if (chosen === 'business') {
+    return 'Build lens: business. Partition L0 by user-facing product capabilities and stages. Name the underlying services in each node brief.'
+  }
+  if (chosen === 'troubleshoot') {
+    return 'Build lens: troubleshoot. Emphasize state transitions, error/timeout/retry branches, idempotency, dead-letter and fallback paths, and background reconciliation flows.'
+  }
+  return 'Build lens: service. Partition L0 and L1 by real deployable microservices, processes, and packages, plus explicit DB, Redis, and MQ resources and sync/async/cron entrypoints. Never merge distinct services into vague product boxes.'
+}
+
+async function repoLines(library: string, repos: string[] | undefined, output: string | undefined): Promise<string> {
+  if (!repos?.length) return ''
+  const targetRoot = output ? path.join(library, output) : library
+  const lines: string[] = ['Repositories to analyse (read them with scan_repo_entrypoints first, then list_files / search_code / read_file):']
+  for (const repo of repos) {
+    const remote = await readGitRemote(repo).catch(() => null)
+    const local = path.relative(targetRoot, repo).split(path.sep).join('/') || '.'
+    lines.push(`- path: ${repo}`)
+    lines.push(`  remote: ${remote ?? '(none)'}`)
+    lines.push(`  local: ${local}  (repo.local relative to ${output ? output + '/' : 'the library root'}; do not hand-count ../../)`)
+  }
+  return lines.join('\n')
+}
+
 export async function systemPrompt(library: string, mode: AgentMode, context: AgentContext, extra?: string): Promise<string> {
   const knowledge = await knowledgeFor(mode)
+  const domainFile = (await readIfPresent(path.join(library, 'domain.md'))) || (await readIfPresent(path.join(library, '.codemap', 'domain.md')))
   const where = [
     `Node library: ${library}`,
     context.stack.length ? `The user has this map open: ${context.stack[context.stack.length - 1]} (path: ${context.stack.join(' > ')})` : 'The user has no map open.',
     context.selected.length ? `Selected nodes: ${context.selected.join(', ')}` : '',
     context.flow ? `Selected flow: ${context.flow}` : '',
-    context.repos?.length ? 'Repositories to analyse (read them with list_files / search_code / read_file):\n' + context.repos.map((r) => '- ' + r).join('\n') : '',
+    await repoLines(library, context.repos, context.output),
     context.docs?.length
       ? 'Knowledge the user added. Read local files with read_file; you cannot open links, so use what the user says about them:\n' + context.docs.map((d) => '- ' + (d.kind === 'url' ? 'link: ' : 'file: ') + d.value).join('\n')
       : '',
-    mode === 'create' ? (context.output ? `Write the new map under ${context.output}/ in the node library (library-relative paths start with ${context.output}/).` : 'Write the new map at the root of the node library.') : ''
+    domainFile ? `Project domain knowledge:\n${domainFile}` : '',
+    mode === 'create' ? (context.output ? `Write the new map under ${context.output}/ in the node library (library-relative paths start with ${context.output}/).` : 'Write the new map at the root of the node library.') : '',
+    mode === 'create' ? tierGuide(context.buildTier) : '',
+    mode === 'create' ? lensGuide(context.buildLens) : ''
   ].filter(Boolean)
   return [BASE, MODE[mode], extra ?? '', knowledge ? `## Codemap knowledge (the workflow and rules to follow; it overrides the defaults above)\n\n${knowledge}` : '', `## Where the user is\n${where.join('\n')}`, LANGUAGE]
     .filter(Boolean)

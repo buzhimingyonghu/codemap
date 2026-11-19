@@ -1,8 +1,8 @@
 import { KeyRound, Plus, RefreshCw, Trash2 } from 'lucide-react'
 import { useEffect, useState } from 'react'
-import { AGENT_MODES, type AgentMode, type AgentProvider, type AgentSettings } from '@shared/agent'
+import { AGENT_MODES, type AgentMode, type AgentProvider, type AgentSettings, type ProviderConnection } from '@shared/agent'
 import { t } from '../lib/i18n'
-import { loadAgentSettings } from '../services/agent'
+import { loadAgentSettings, selectProvider, useAgent } from '../services/agent'
 import { notify, reportError } from '../services/ui'
 
 // Settings → AI: which model service the assistant uses and the default model per mode.
@@ -10,18 +10,43 @@ import { notify, reportError } from '../services/ui'
 
 const MODE_LABEL = (): Record<AgentMode, string> => ({ ask: t('Ask'), adjust: t('Adjust map'), create: t('Build map'), require: t('Requirement') })
 
+function localProviderTitle(provider: AgentProvider): string {
+  if (provider.localSource === 'claude' || provider.id === 'local-gateway') return t('Claude Code Gateway')
+  if (provider.localSource === 'codex' || provider.id === 'local-codex') return t('Codex / Magpie Gateway')
+  return t('Local gateway')
+}
+
 function newProvider(): AgentProvider {
   return { id: 'custom-' + Math.random().toString(36).slice(2, 7), name: t('Custom provider'), kind: 'openai', baseUrl: 'https://', keySource: 'stored', model: '' }
 }
 
 export function AgentSettingsSection() {
+  const agent = useAgent()
   const [s, setS] = useState<AgentSettings | null>(null)
   const [keys, setKeys] = useState<Record<string, string>>({})
   const [models, setModels] = useState<Record<string, string[]>>({})
   const [busy, setBusy] = useState(false)
+  const [testing, setTesting] = useState(false)
+  const [testResult, setTestResult] = useState<ProviderConnection | null>(null)
   useEffect(() => {
     void window.codemap.agent.settings().then(setS, () => setS(null))
   }, [])
+  const activeId = s?.activeProvider ?? ''
+  const activeHasKey = s?.providers.find((provider) => provider.id === activeId)?.hasKey
+  useEffect(() => {
+    if (!activeId || activeHasKey === false) return
+    let cancelled = false
+    void window.codemap.agent.models(activeId).then(
+      (list) => {
+        if (cancelled) return
+        setModels((current) => (current[activeId] ? current : { ...current, [activeId]: list }))
+      },
+      () => undefined
+    )
+    return () => {
+      cancelled = true
+    }
+  }, [activeId, activeHasKey])
   if (!s) return null
 
   const patch = (id: string, change: Partial<AgentProvider>) => setS({ ...s, providers: s.providers.map((p) => (p.id === id ? { ...p, ...change } : p)) })
@@ -33,6 +58,7 @@ export function AgentSettingsSection() {
       setKeys({})
       setS(saved)
       await loadAgentSettings()
+      if (saved.activeProvider) await selectProvider(saved.activeProvider, { keepModel: true })
       notify(t('AI settings saved'), 'success')
     } catch (error) {
       reportError(error, t('Cannot save AI settings'))
@@ -51,6 +77,19 @@ export function AgentSettingsSection() {
   }
   const active = s.providers.find((p) => p.id === s.activeProvider)
   const activeModels = active ? (models[active.id] ?? []) : []
+  const testConnection = async () => {
+    setTesting(true)
+    setTestResult(null)
+    try {
+      const chosenModel = (s.activeProvider === (agent.providerId || agent.settings?.activeProvider) ? agent.model : '') || active?.model || undefined
+      const res = await window.codemap.agent.testConnection(s.activeProvider, chosenModel)
+      setTestResult(res)
+    } catch (error) {
+      setTestResult({ ok: false, model: active?.model ?? '', kind: active?.kind ?? 'openai', latencyMs: 0, message: error instanceof Error ? error.message : String(error) })
+    } finally {
+      setTesting(false)
+    }
+  }
 
   return (
     <section className="field-group">
@@ -64,7 +103,7 @@ export function AgentSettingsSection() {
           <div key={p.id} className={'ai-provider' + (isActive ? ' is-active' : '')}>
             <div className="ai-provider-head">
               <input type="radio" name="ai-active" checked={isActive} aria-label={t('Use this provider')} onChange={() => setS({ ...s, activeProvider: p.id })} />
-              {tt ? <span className="ai-provider-name">{t('Local gateway')}</span> : <input className="input ai-provider-name" value={p.name} onChange={(e) => patch(p.id, { name: e.target.value })} />}
+              {tt ? <span className="ai-provider-name">{localProviderTitle(p)}</span> : <input className="input ai-provider-name" value={p.name} onChange={(e) => patch(p.id, { name: e.target.value })} />}
               <span className={'ai-provider-state ' + (p.hasKey ? 'is-ok' : 'is-bad')}>
                 {tt ? (p.hasKey ? t('Connected') : t('Local gateway not found')) : p.hasKey ? t('Key saved') : t('No key')}
               </span>
@@ -100,7 +139,10 @@ export function AgentSettingsSection() {
               ) : (
                 <>
                   <span>{t('Address')}</span>
-                  <span className="mono">{p.baseUrl}</span>
+                  <span className="ai-provider-endpoint">
+                    <span className="mono">{p.baseUrl}</span>
+                    <span className="ai-kind">{p.kind === 'openai' ? 'OpenAI' : 'Anthropic'}</span>
+                  </span>
                 </>
               )}
               <span>{t('Default model')}</span>
@@ -149,9 +191,19 @@ export function AgentSettingsSection() {
       </div>
 
       <div className="ai-save">
+        <button type="button" className="button" disabled={busy || testing} onClick={() => void testConnection()}>
+          {testing ? t('Testing connection…') : t('Test Connection')}
+        </button>
         <button type="button" className="button button--primary" disabled={busy} onClick={() => void save()}>
           {t('Save AI settings')}
         </button>
+        {testResult ? (
+          <span className={'ai-provider-state ' + (testResult.ok ? 'is-ok' : 'is-bad')} role="status">
+            {testResult.ok
+              ? `${t('Connected · {ms}ms', { ms: testResult.latencyMs })}${testResult.model ? ` · ${testResult.model} (${testResult.kind})` : ''}`
+              : `${t('Connection test failed')}: ${testResult.message}`}
+          </span>
+        ) : null}
       </div>
     </section>
   )

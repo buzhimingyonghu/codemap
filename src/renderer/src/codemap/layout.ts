@@ -2,10 +2,10 @@ import { fnOf, roleOf } from '@shared/codemap/codemap.mjs'
 import type { MapView, ViewEdge, ViewLoop } from './model'
 
 // Automatic layout for one map. Execution maps (with functions) are laid out by execution
-// order with lanes as code modules; structure maps put lanes in columns. Lanes only decide
-// where nodes start; they are not drawn. A lane with `dock` sits in a band on that side of the
+// order with lanes as code modules; structure maps put lanes in columns and expose those
+// regions so the canvas can draw them. A lane with `dock` sits in a band on that side of the
 // map. Nodes outside the map sit on the left (upstream) or right (downstream). A map's saved
-// `layout` overrides all of this.
+// `layout` overrides all of this and hides the lane regions.
 
 export const NW = 140
 export const NH = 46
@@ -24,12 +24,26 @@ export interface Box {
 
 export type Side = 'top' | 'bottom' | 'left' | 'right'
 
-/** The area a lane takes; used for spacing and the map bounds only, never drawn. */
+/** A named region the canvas draws behind the nodes. Only structure maps fill these. */
+export interface LaneArea {
+  id: string
+  name: string
+  x: number
+  y: number
+  w: number
+  h: number
+  dock?: Side
+}
+
+/** Spacing box used while placing nodes. Structure maps promote named ones to `LaneArea`. */
 interface LaneBox {
   x: number
   y: number
   w: number
   h: number
+  id?: string
+  name?: string
+  dock?: Side
 }
 
 export interface Layout {
@@ -39,6 +53,8 @@ export interface Layout {
   pinned: Set<string>
   /** True when the map has a saved layout (positions are frozen). */
   manual: boolean
+  /** Named regions behind structure-map columns and docked bands. Empty when manual or exec. */
+  laneAreas: LaneArea[]
 }
 
 /** Saved positions of this map: node id → [x, y] (keys resolved like edge ends). */
@@ -96,6 +112,27 @@ interface Group {
   ids: string[]
 }
 
+const LANE_HEADER = 28
+const LANE_HEADER_DOCK = 22
+const COL_GAP = 96
+const ROWH = 112
+const CARD_MIN = 146
+const CARD_MAX = 204
+
+/** Card width. Structure maps grow with the title; execution maps and the outside stay fixed. */
+export function nodeWidthFor(name: string, brief: string, isStructure: boolean): number {
+  if (!isStructure) return NW
+  const desired = Math.max(textWidth(name, 13) + 28, textWidth(brief, 11) + 24)
+  const clamped = Math.min(CARD_MAX, Math.max(CARD_MIN, desired))
+  return Math.round(clamped / 2) * 2
+}
+
+function cardSize(v: MapView, id: string, isStructure: boolean): { w: number; h: number } {
+  if (!isStructure) return { w: NW, h: NH }
+  const n = v.node(id)
+  return { w: nodeWidthFor(String(n?.name ?? id), String(n?.brief ?? ''), true), h: NH }
+}
+
 export function computeLayout(v: MapView, viewport: { width: number; height: number }): Layout {
   // Placement follows the lanes only: a lane with `dock` becomes a band on that side of the
   // business area; every other lane is a business column. A node's kind never moves it.
@@ -111,6 +148,7 @@ export function computeLayout(v: MapView, viewport: { width: number; height: num
   const rank = rankNodes(ids, flowEdges)
   const pos = new Map<string, Box>()
   const lanes: LaneBox[] = []
+  const laneAreas: LaneArea[] = []
 
   const groups: Group[] = []
   const laneOf = new Map<string, Group>()
@@ -191,7 +229,8 @@ export function computeLayout(v: MapView, viewport: { width: number; height: num
     for (const [id, q] of best.p) pos.set(id, q)
     lanes.push(...best.ls)
   } else {
-    const cols: Group[] = groups.filter((g) => g.ids.length)
+    const named = v.lanes.filter((l) => !l.dock).map((l) => l.id)
+    const cols: Group[] = groups.filter((g) => g.ids.length).map((g) => ({ id: g.id, ids: g.ids.slice() }))
     if (rest.length) {
       if (groups.length) cols.push({ id: '_', ids: rest })
       else {
@@ -204,18 +243,26 @@ export function computeLayout(v: MapView, viewport: { width: number; height: num
         for (const r of [...byRank.keys()].sort((a, b) => a - b)) cols.push({ id: `r${r}`, ids: byRank.get(r)! })
       }
     }
-    const COLW = NW + 90
-    const ROWH = 104
-    const H = Math.max(1, ...cols.map((c) => c.ids.length)) * ROWH
+    if (cols.length >= 2) orderColumns(cols, flowEdges)
+    const showLanes = v.lanes.some((l) => !l.dock && (Boolean(l.name) || (l.id !== '_' && !/^r\d+$/.test(l.id))))
+    const laneName = new Map(v.lanes.filter((l) => !l.dock).map((l) => [l.id, l.name || l.id]))
+    const colW = cols.map((c) => Math.min(CARD_MAX, Math.max(CARD_MIN, ...c.ids.map((id) => cardSize(v, id, true).w))))
+    const H = Math.max(1, ...cols.map((c) => c.ids.length), 1) * ROWH
+    let x0 = 0
     cols.forEach((c, i) => {
-      const x0 = i * COLW
-      lanes.push({ x: x0 + 14, y: 0, w: COLW - 28, h: H + 30 })
-      c.ids.forEach((id, j) => pos.set(id, { x: x0 + COLW / 2, y: ((j + 0.5) * H) / c.ids.length + 4, w: NW + 10, h: NH + 4 }))
+      const w = colW[i] || NW + 12
+      const header = showLanes && named.includes(c.id) && laneName.has(c.id) ? LANE_HEADER : 0
+      lanes.push({ x: x0, y: 0, w: w + 36, h: H + header + 24, id: c.id, name: header ? laneName.get(c.id) : undefined })
+      c.ids.forEach((id, j) => {
+        const y = header + 16 + (j + 0.5) * (c.ids.length ? H / c.ids.length : ROWH)
+        pos.set(id, { x: x0 + 18 + w / 2, y, w, h: NH })
+      })
+      x0 += w + COL_GAP
     })
   }
 
   // Left and right bands come before the outside nodes, so those stay the outermost columns.
-  for (const side of ['left', 'right'] as const) placeBand(v, dockOf, pos, lanes, side)
+  for (const side of ['left', 'right'] as const) placeBand(v, dockOf, pos, lanes, side, !exec)
 
   if (v.outside.length && pos.size) {
     const boxes = [...pos.values()]
@@ -246,7 +293,7 @@ export function computeLayout(v: MapView, viewport: { width: number; height: num
     }
   }
 
-  for (const side of ['top', 'bottom'] as const) placeBand(v, dockOf, pos, lanes, side)
+  for (const side of ['top', 'bottom'] as const) placeBand(v, dockOf, pos, lanes, side, !exec)
 
   // Loop frames need room: push nodes outside a loop off its frame (automatic layout only).
   makeRoomForLoops(v.loops, pos)
@@ -279,6 +326,13 @@ export function computeLayout(v: MapView, viewport: { width: number; height: num
     lanes.length = 0
   }
 
+  if (!manual && !exec) {
+    for (const l of lanes) {
+      if (!l.name) continue
+      laneAreas.push({ id: l.id ?? l.name, name: l.name, x: l.x, y: l.y, w: l.w, h: l.h, dock: l.dock })
+    }
+  }
+
   const xs: number[] = []
   const ys: number[] = []
   for (const p of pos.values()) xs.push(p.x - p.w / 2, p.x + p.w / 2), ys.push(p.y - p.h / 2 - 18, p.y + p.h / 2)
@@ -292,7 +346,7 @@ export function computeLayout(v: MapView, viewport: { width: number; height: num
   const by = Math.min(...ys, 0) - pad
   const bw = Math.max(...xs, 400) + pad - bx
   const bh = Math.max(...ys, 240) + pad - by
-  return { pos, box: { x: bx, y: by, w: bw, h: bh }, pinned, manual }
+  return { pos, box: { x: bx, y: by, w: bw, h: bh }, pinned, manual, laneAreas }
 }
 
 function sidePoint(b: Box, side: Side, offset: number): [number, number] {
@@ -385,25 +439,66 @@ export function edgeGeometry(a: Box, b: Box, offset = 0): { d: string; mid: [num
   return { d: `M${p0[0]},${p0[1]} C${p1[0]},${p1[1]} ${p2[0]},${p2[1]} ${p3[0]},${p3[1]}`, mid }
 }
 
-const BAND_GAP = 70
+const BAND_GAP = 48
 const BAND_PAD = 18
+
+/**
+ * Two barycenter sweeps. Column order stays as the YAML wrote it; only the order inside a
+ * column moves, so a crossed pair (A→D, B→C) uncrosses without shuffling the lanes.
+ */
+function orderColumns(cols: Group[], edges: Pick<ViewEdge, 'from' | 'to'>[]): void {
+  const colOf = new Map<string, number>()
+  cols.forEach((c, i) => c.ids.forEach((id) => colOf.set(id, i)))
+  const neigh = new Map<string, string[]>()
+  for (const id of colOf.keys()) neigh.set(id, [])
+  for (const e of edges) {
+    if (!colOf.has(e.from) || !colOf.has(e.to) || e.from === e.to) continue
+    neigh.get(e.from)!.push(e.to)
+    neigh.get(e.to)!.push(e.from)
+  }
+  const rankIn = (ids: string[]) => new Map(ids.map((id, i) => [id, ids.length <= 1 ? 0.5 : i / (ids.length - 1)]))
+  const sweep = (dir: 1 | -1) => {
+    const order = cols.map((_, i) => i)
+    if (dir < 0) order.reverse()
+    for (const i of order) {
+      // Forward looks left (already swept); backward looks right.
+      const other = i - dir
+      if (other < 0 || other >= cols.length) continue
+      const rank = rankIn(cols[other].ids)
+      const scored = cols[i].ids.map((id, index) => {
+        const at = (neigh.get(id) ?? []).filter((n) => colOf.get(n) === other).map((n) => rank.get(n)!)
+        const fallback = cols[i].ids.length <= 1 ? 0.5 : index / (cols[i].ids.length - 1)
+        return { id, index, bary: at.length ? at.reduce((a, b) => a + b, 0) / at.length : fallback }
+      })
+      scored.sort((a, b) => a.bary - b.bary || a.index - b.index)
+      cols[i].ids = scored.map((s) => s.id)
+    }
+  }
+  sweep(1)
+  sweep(-1)
+}
 
 /**
  * Places the nodes docked to `side` in a band on that side of everything placed so far. Each
  * node sits across from the business nodes that use it, so its lines run almost straight.
  */
-function placeBand(v: MapView, dockOf: Map<string, Side>, pos: Map<string, Box>, lanes: LaneBox[], side: Side): void {
+function placeBand(v: MapView, dockOf: Map<string, Side>, pos: Map<string, Box>, lanes: LaneBox[], side: Side, isStructure: boolean): void {
   const ids = [...dockOf].filter(([, s]) => s === side).map(([id]) => id)
   if (!ids.length || !pos.size) return
-  const boxes = [...pos.values()]
-  const top = Math.min(...boxes.map((p) => p.y - p.h / 2), ...lanes.map((l) => l.y))
-  const bottom = Math.max(...boxes.map((p) => p.y + p.h / 2), ...lanes.map((l) => l.y + l.h))
-  const left = Math.min(...boxes.map((p) => p.x - p.w / 2), ...lanes.map((l) => l.x))
-  const right = Math.max(...boxes.map((p) => p.x + p.w / 2), ...lanes.map((l) => l.x + l.w))
+  // Bands sit against the business nodes, not against another band's frame.
+  const boxes = [...pos.values()].filter((p) => !p.dock)
+  if (!boxes.length) return
+  const businessLanes = lanes.filter((l) => !l.dock)
+  const top = Math.min(...boxes.map((p) => p.y - p.h / 2), ...businessLanes.map((l) => l.y))
+  const bottom = Math.max(...boxes.map((p) => p.y + p.h / 2), ...businessLanes.map((l) => l.y + l.h))
+  const left = Math.min(...boxes.map((p) => p.x - p.w / 2), ...businessLanes.map((l) => l.x))
+  const right = Math.max(...boxes.map((p) => p.x + p.w / 2), ...businessLanes.map((l) => l.x + l.w))
   const order = new Map(v.members.map((id, i) => [id, i]))
   // Top / bottom bands spread along x; left / right bands stack along y.
   const horizontal = side === 'top' || side === 'bottom'
-  const size = horizontal ? NW : NH
+  const widthOf = new Map(ids.map((id) => [id, cardSize(v, id, isStructure).w]))
+  const sizeOf = (id: string) => (horizontal ? widthOf.get(id)! : NH)
+  const maxW = Math.max(...ids.map((id) => widthOf.get(id)!))
   const gap = 20
   const [lo, hi] = horizontal ? [left, right] : [top, bottom]
   // Desired place: the mean of the business nodes it connects to; unconnected ones keep their order.
@@ -418,24 +513,39 @@ function placeBand(v: MapView, dockOf: Map<string, Side>, pos: Map<string, Box>,
   })
   want.sort((a, b) => a.at - b.at || order.get(a.id)! - order.get(b.id)!)
   // Unconnected nodes go after the connected ones.
-  let cursor = lo + size / 2
-  for (const item of want) {
-    if (!Number.isFinite(item.at)) item.at = cursor
-    cursor = item.at + size + gap
+  let cursor = lo
+  for (let i = 0; i < want.length; i++) {
+    const half = sizeOf(want[i].id) / 2
+    if (!Number.isFinite(want[i].at)) want[i].at = cursor + half
+    cursor = want[i].at + half + gap
   }
   // Push apart, then pull back from the far end if the band overflowed.
-  for (let i = 1; i < want.length; i++) want[i].at = Math.max(want[i].at, want[i - 1].at + size + gap)
-  const overflow = want[want.length - 1].at + size / 2 - Math.max(hi, lo + want.length * (size + gap))
+  for (let i = 1; i < want.length; i++) want[i].at = Math.max(want[i].at, want[i - 1].at + sizeOf(want[i - 1].id) / 2 + gap + sizeOf(want[i].id) / 2)
+  const span = want.reduce((sum, item) => sum + sizeOf(item.id), 0) + gap * Math.max(0, want.length - 1)
+  const overflow = want[want.length - 1].at + sizeOf(want[want.length - 1].id) / 2 - Math.max(hi, lo + span)
   if (overflow > 0) for (const item of want) item.at -= overflow
-  for (let i = want.length - 2; i >= 0; i--) want[i].at = Math.min(want[i].at, want[i + 1].at - size - gap)
-  const fixed = side === 'bottom' ? bottom + BAND_GAP + NH / 2 : side === 'top' ? top - BAND_GAP - NH / 2 : side === 'left' ? left - BAND_GAP - NW / 2 : right + BAND_GAP + NW / 2
-  for (const item of want) pos.set(item.id, horizontal ? { x: item.at, y: fixed, w: NW, h: NH, dock: side } : { x: fixed, y: item.at, w: NW, h: NH, dock: side })
-  const a0 = Math.min(lo, want[0].at - size / 2) - BAND_PAD
-  const a1 = Math.max(hi, want[want.length - 1].at + size / 2) + BAND_PAD
+  for (let i = want.length - 2; i >= 0; i--) want[i].at = Math.min(want[i].at, want[i + 1].at - sizeOf(want[i + 1].id) / 2 - gap - sizeOf(want[i].id) / 2)
+  const header = isStructure ? LANE_HEADER_DOCK : 0
+  const fixed =
+    side === 'bottom'
+      ? bottom + BAND_GAP + header + BAND_PAD + NH / 2
+      : side === 'top'
+        ? top - BAND_GAP - BAND_PAD - NH / 2
+        : side === 'left'
+          ? left - BAND_GAP - BAND_PAD - maxW / 2
+          : right + BAND_GAP + BAND_PAD + maxW / 2
+  for (const item of want) {
+    const w = horizontal ? widthOf.get(item.id)! : maxW
+    pos.set(item.id, horizontal ? { x: item.at, y: fixed, w, h: NH, dock: side } : { x: fixed, y: item.at, w, h: NH, dock: side })
+  }
+  const names = [...new Set(v.lanes.filter((l) => l.dock === side).map((l) => l.name || l.id))]
+  const title = names.join(' / ')
+  const a0 = Math.min(lo, want[0].at - sizeOf(want[0].id) / 2) - BAND_PAD
+  const a1 = Math.max(hi, want[want.length - 1].at + sizeOf(want[want.length - 1].id) / 2) + BAND_PAD
   lanes.push(
     horizontal
-      ? { x: a0, y: fixed - NH / 2 - BAND_PAD, w: a1 - a0, h: NH + 2 * BAND_PAD }
-      : { x: fixed - NW / 2 - BAND_PAD, y: a0, w: NW + 2 * BAND_PAD, h: a1 - a0 }
+      ? { id: side, name: title, dock: side, x: a0, y: fixed - NH / 2 - header - BAND_PAD, w: a1 - a0, h: NH + header + 2 * BAND_PAD }
+      : { id: side, name: title, dock: side, x: fixed - maxW / 2 - BAND_PAD, y: a0 - header, w: maxW + 2 * BAND_PAD, h: a1 - a0 + header }
   )
 }
 

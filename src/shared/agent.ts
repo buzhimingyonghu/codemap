@@ -4,6 +4,25 @@ export type AgentMode = 'create' | 'ask' | 'adjust' | 'require'
 
 export const AGENT_MODES: AgentMode[] = ['ask', 'adjust', 'create', 'require']
 
+export type BuildTier = 'fast' | 'balanced' | 'deep'
+export const BUILD_TIERS: BuildTier[] = ['fast', 'balanced', 'deep']
+
+export type BuildLens = 'service' | 'business' | 'troubleshoot'
+export const BUILD_LENSES: BuildLens[] = ['service', 'business', 'troubleshoot']
+
+export interface AgentUsageSummary {
+  /** Latest main-agent request prompt tokens (actual active context window size). */
+  contextTokens: number
+  /** Cumulative input tokens across main turns in this conversation. */
+  totalInput: number
+  /** Cumulative output tokens across main turns in this conversation. */
+  totalOutput: number
+  /** Cumulative input tokens spent by parallel sub-agents. */
+  workerInput?: number
+  /** Cumulative output tokens spent by parallel sub-agents. */
+  workerOutput?: number
+}
+
 /** Wire protocol of a model provider. */
 export type ProviderKind = 'anthropic' | 'openai'
 
@@ -17,8 +36,12 @@ export interface AgentProvider {
   keySource: 'stored' | 'local'
   /** Whether a key is available (the key itself never leaves the main process). */
   hasKey?: boolean
+  /** Which local client supplied a local gateway: Claude Code or Codex. */
+  localSource?: 'claude' | 'codex'
   /** Default model id for this provider. */
   model: string
+  /** Alias models known to a local gateway but not returned by its model list. Not persisted. */
+  extraModels?: string[]
 }
 
 /** Model per mode; missing means the provider's default model. */
@@ -30,6 +53,14 @@ export interface AgentSettings {
   modeModels: ModeModels
   /** Parallel sub-agents allowed in create mode. */
   maxParallel: number
+}
+
+export interface ProviderConnection {
+  ok: boolean
+  model: string
+  kind: ProviderKind
+  latencyMs: number
+  message: string
 }
 
 /** What the user is looking at when a message is sent. */
@@ -46,6 +77,10 @@ export interface AgentContext {
   docs?: Array<{ kind: 'file' | 'url'; value: string }>
   /** Build map: folder inside the node library to write the new map into (empty: the library root). */
   output?: string
+  /** Build map speed/depth tier: fast (L0+L1 skeleton, 0 gates), balanced (1 blueprint gate), deep (full drill-down). */
+  buildTier?: BuildTier
+  /** Build map lens: service (real microservices & storage), business (product stages), troubleshoot (state & failure/retry). */
+  buildLens?: BuildLens
 }
 
 export interface AgentStartRequest {
@@ -56,6 +91,8 @@ export interface AgentStartRequest {
   sessionId?: string
   /** Model override for this run. */
   model?: string
+  /** Provider override for this run; omitted uses the active provider. */
+  providerId?: string
 }
 
 /** Build map: the repositories, knowledge and output folder a conversation works from. Saved with it. */
@@ -63,6 +100,8 @@ export interface AgentSources {
   repos: string[]
   docs: Array<{ kind: 'file' | 'url'; value: string }>
   output: string
+  buildTier?: BuildTier
+  buildLens?: BuildLens
 }
 
 /** What a run is doing right now, shown above the input while it goes. */
@@ -97,18 +136,19 @@ export interface AgentChangeSet {
 
 export type AgentEvent =
   | { type: 'session'; sessionId: string; mode: AgentMode; title: string }
-  | { type: 'text'; sessionId: string; runId: string; text: string }
+  | { type: 'text'; sessionId: string; runId: string; text: string; append?: boolean }
   | { type: 'tool'; sessionId: string; runId: string; callId: string; name: string; label: string }
   | { type: 'tool-result'; sessionId: string; runId: string; callId: string; ok: boolean; summary: string }
   /** The map follows the agent: open `map`, light up `nodes`, optionally select `flow`. */
   | { type: 'focus'; sessionId: string; runId: string; map: string | null; nodes: string[]; flow?: string | null; note?: string }
   | { type: 'changeset'; sessionId: string; runId: string; changeSet: AgentChangeSet }
+  | { type: 'changeset-discarded'; sessionId: string; changeSetId: string }
   /** Create mode: a review gate; the run stops until the user approves or sends feedback. */
   | { type: 'gate'; sessionId: string; runId: string; stage: string; summary: string }
   | { type: 'worker'; sessionId: string; runId: string; workerId: string; node: string; state: 'running' | 'done' | 'failed' | 'stopped'; note?: string }
   /** A sub-agent's progress: a tool step (ok/summary when it finished), a line it wrote, or nodes it points at. */
   | { type: 'worker-step'; sessionId: string; runId: string; workerId: string; node: string; label: string; ok?: boolean; summary?: string; lit?: string[]; note?: boolean }
-  | { type: 'usage'; sessionId: string; runId: string; input: number; output: number }
+  | { type: 'usage'; sessionId: string; runId: string; input: number; output: number; contextTokens?: number; isWorker?: boolean }
   /** The run moved to another phase; turn counts model calls in this run. */
   | { type: 'phase'; sessionId: string; runId: string; phase: AgentPhase; turn: number; label?: string }
   | { type: 'error'; sessionId: string; runId: string; message: string }
@@ -144,6 +184,8 @@ export interface AgentSessionInfo {
   gate?: { stage: string; summary: string } | null
   /** Build map: what the conversation works from. */
   sources?: AgentSources
+  /** Persisted token usage summary for this conversation. */
+  usage?: AgentUsageSummary
 }
 
 export interface AgentSessionSummary {

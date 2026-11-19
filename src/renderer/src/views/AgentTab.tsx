@@ -1,6 +1,6 @@
-import { BookOpen, Check, ChevronDown, CircleAlert, CircleCheck, CircleSlash, Eye, EyeOff, FolderGit2, FolderOutput, History, Link2, LoaderCircle, MessageSquarePlus, Plus, Send, Sparkles, Square, Trash2, X } from 'lucide-react'
+import { BookOpen, Check, ChevronDown, CircleAlert, CircleCheck, CircleSlash, Eye, EyeOff, FolderGit2, FolderOutput, History, Link2, LoaderCircle, MessageSquarePlus, Plus, Send, Settings2, Sparkles, Square, Trash2, X } from 'lucide-react'
 import { useEffect, useRef, useState, type ReactNode } from 'react'
-import { AGENT_MODES, type AgentChangeSet, type AgentEndReason, type AgentMode, type AgentStepView } from '@shared/agent'
+import { AGENT_MODES, BUILD_LENSES, BUILD_TIERS, type AgentChangeSet, type AgentEndReason, type AgentMode, type AgentProvider, type AgentStepView, type AgentUsageSummary, type BuildLens, type BuildTier } from '@shared/agent'
 import { t } from '../lib/i18n'
 import {
   addLink,
@@ -15,14 +15,19 @@ import {
   openSession,
   previewChangeSet,
   previewing,
-  rejectChangeSet,
   restoreSession,
   send,
+  selectProvider,
   setMode,
   setModel,
   setOutput,
   applyChangeSet,
+  discardChangeSet,
+  discardStaleDrafts,
+  drillDownNode,
   stop,
+  setBuildLens,
+  setBuildTier,
   useAgent,
   type WorkerView
 } from '../services/agent'
@@ -114,6 +119,7 @@ function Sources() {
       </button>
       {open ? (
         <div className="ag-sources-body">
+          <BuildControls />
           <Output />
           <div className="ag-sources-row">
             <span className="ag-sources-lab">
@@ -173,6 +179,47 @@ function Sources() {
           {agent.docs.some((d) => d.kind === 'url') ? <div className="ag-sources-hint">{t('Links are passed along as references; paste the key content into the message if the assistant needs it.')}</div> : null}
         </div>
       ) : null}
+    </div>
+  )
+}
+
+const TIER_LABEL = (): Record<BuildTier, string> => ({ fast: t('Fast'), balanced: t('Balanced'), deep: t('Deep') })
+const TIER_HINT = (): Record<BuildTier, string> => ({
+  fast: t('Fast: L0+L1 skeleton with zero review pauses'),
+  balanced: t('Balanced: align structured blueprint once, then build L0+L1'),
+  deep: t('Deep: stage-by-stage drill-down to functions and branches')
+})
+const LENS_LABEL = (): Record<BuildLens, string> => ({ service: t('Services & Storage'), business: t('Business Flow'), troubleshoot: t('Troubleshooting') })
+const LENS_HINT = (): Record<BuildLens, string> => ({
+  service: t('Group by real microservices, entrypoints, DB/Redis/MQ'),
+  business: t('Group by user-facing product capabilities and stages'),
+  troubleshoot: t('Highlight state transitions, retries, timeouts, and background jobs')
+})
+
+function BuildControls() {
+  const agent = useAgent()
+  return (
+    <div className="ag-build">
+      <div className="ag-build-row">
+        <span className="ag-sources-lab">{t('Build tier')}</span>
+        <div className="segmented ag-build-seg" role="radiogroup" aria-label={t('Build tier')}>
+          {BUILD_TIERS.map((tier) => (
+            <button key={tier} type="button" role="radio" aria-checked={agent.buildTier === tier} className={agent.buildTier === tier ? 'is-on' : undefined} title={TIER_HINT()[tier]} data-tooltip={TIER_HINT()[tier]} disabled={agent.running} onClick={() => setBuildTier(tier)}>
+              {TIER_LABEL()[tier]}
+            </button>
+          ))}
+        </div>
+      </div>
+      <div className="ag-build-row">
+        <span className="ag-sources-lab">{t('Perspective')}</span>
+        <div className="segmented ag-build-seg" role="radiogroup" aria-label={t('Perspective')}>
+          {BUILD_LENSES.map((lens) => (
+            <button key={lens} type="button" role="radio" aria-checked={agent.buildLens === lens} className={agent.buildLens === lens ? 'is-on' : undefined} title={LENS_HINT()[lens]} data-tooltip={LENS_HINT()[lens]} disabled={agent.running} onClick={() => setBuildLens(lens)}>
+              {LENS_LABEL()[lens]}
+            </button>
+          ))}
+        </div>
+      </div>
     </div>
   )
 }
@@ -277,9 +324,6 @@ export function AgentTab({ selected, onFocusNode }: { selected: string | null; o
             ))}
           </div>
         ) : null}
-        {changeSetChains(agent.changeSets).map(({ set, earlier }) =>
-          agent.running && set.status === 'proposed' ? <DraftLine key={set.id} set={set} /> : <ChangeSetCard key={set.id} set={set} earlier={earlier} />
-        )}
         {agent.running ? <Progress /> : null}
         {agent.gate ? (
           <div className="ag-gate">
@@ -299,6 +343,8 @@ export function AgentTab({ selected, onFocusNode }: { selected: string | null; o
         ) : null}
       </div>
 
+      <ProposalTray />
+
       {agent.note ? <div className="ag-note">{agent.note}</div> : null}
       <div className="ag-compose">
         {selected && agent.mode !== 'create' ? (
@@ -306,6 +352,9 @@ export function AgentTab({ selected, onFocusNode }: { selected: string | null; o
             <span className="cm-muted">{t('About')}</span>
             <button type="button" className="cm-pill is-link" onClick={() => onFocusNode(selected)}>
               {selected}
+            </button>
+            <button type="button" className="button ag-drill" disabled={agent.running} onClick={() => void drillDownNode(selected)}>
+              {t('Drill down this node')}
             </button>
           </div>
         ) : null}
@@ -330,10 +379,10 @@ export function AgentTab({ selected, onFocusNode }: { selected: string | null; o
           </ul>
         ) : null}
         <div className="ag-compose-bar">
-          <ModelPicker />
-          {agent.usage.input ? (
-            <span className="ag-usage" data-tooltip={t('Tokens used in this conversation')}>
-              {Math.round(agent.usage.input / 1000)}k / {Math.round(agent.usage.output / 1000)}k
+          <ProviderModelPicker />
+          {agent.usage.contextTokens > 0 || agent.usage.totalInput > 0 ? (
+            <span className="ag-usage" title={usageTip(agent.usage)} data-tooltip={usageTip(agent.usage)}>
+              {t('Ctx {ctx}', { ctx: fmtTokens(agent.usage.contextTokens) })}
             </span>
           ) : null}
           {agent.running ? (
@@ -491,46 +540,146 @@ function Steps({ steps }: { steps: AgentStepView[] }) {
   )
 }
 
-/** While the agent works, a proposal is a draft it is still writing and checking: no buttons yet. */
+function fmtTokens(n: number): string {
+  if (n < 1000) return String(n)
+  if (n < 1_000_000) return `${(n / 1000).toFixed(n >= 10_000 ? 0 : 1)}k`
+  return `${(n / 1_000_000).toFixed(2)}M`
+}
+
+function usageTip(u: AgentUsageSummary): string {
+  if ((u.workerInput ?? 0) > 0) {
+    return t('Context window: {ctx} tokens · Main in/out: {in}/{out} · Sub-agents in/out: {win}/{wout}', {
+      ctx: fmtTokens(u.contextTokens),
+      in: fmtTokens(u.totalInput),
+      out: fmtTokens(u.totalOutput),
+      win: fmtTokens(u.workerInput ?? 0),
+      wout: fmtTokens(u.workerOutput ?? 0)
+    })
+  }
+  return t('Context window: {ctx} tokens · Cumulative input: {in} · Output: {out}', {
+    ctx: fmtTokens(u.contextTokens),
+    in: fmtTokens(u.totalInput),
+    out: fmtTokens(u.totalOutput)
+  })
+}
+
+function isStaleDraft(set: AgentChangeSet): boolean {
+  return set.status === 'rejected' || (set.status === 'proposed' && set.problems.some((problem) => problem.level === 'error'))
+}
+
+function problemCounts(set: AgentChangeSet): { errors: number; warnings: number } {
+  return {
+    errors: set.problems.filter((problem) => problem.level === 'error').length,
+    warnings: set.problems.filter((problem) => problem.level !== 'error').length
+  }
+}
+
+/** Proposals live outside the conversation so applied and rejected cards do not break the reading flow. */
+function ProposalTray() {
+  const agent = useAgent()
+  const chains = changeSetChains(agent.changeSets)
+  const pending = chains.filter(({ set }) => set.status === 'proposed')
+  const processed = chains.filter(({ set }) => set.status === 'applied' || set.status === 'rejected')
+  const staleCount = agent.changeSets.filter(isStaleDraft).length
+  const [pendingOpen, setPendingOpen] = useState(true)
+  const [processedOpen, setProcessedOpen] = useState(false)
+  if (!chains.length) return null
+  return (
+    <div className="ag-tray">
+      {pending.length ? (
+        <section className={'ag-tray-group' + (pendingOpen ? ' is-open' : '')}>
+          <div className="ag-tray-head">
+            <button type="button" className="ag-tray-toggle" aria-expanded={pendingOpen} onClick={() => setPendingOpen((open) => !open)}>
+              <ChevronDown size={12} className={pendingOpen ? 'is-open' : ''} />
+              {t('Pending proposals ({n})', { n: pending.length })}
+            </button>
+            {staleCount >= 2 && !agent.running ? (
+              <button type="button" className="button ag-sources-add" onClick={() => void discardStaleDrafts()}>
+                {t('Clean up stale drafts ({n})', { n: staleCount })}
+              </button>
+            ) : null}
+          </div>
+          {pendingOpen ? (
+            <div className="ag-tray-list">
+              {pending.map(({ set, earlier }) =>
+                agent.running ? <DraftLine key={set.id} set={set} /> : <ChangeSetCard key={set.id} set={set} earlier={earlier} />
+              )}
+            </div>
+          ) : null}
+        </section>
+      ) : staleCount >= 2 && !agent.running ? (
+        <div className="ag-tray-head">
+          <button type="button" className="button ag-sources-add" onClick={() => void discardStaleDrafts()}>
+            {t('Clean up stale drafts ({n})', { n: staleCount })}
+          </button>
+        </div>
+      ) : null}
+      {processed.length ? (
+        <section className={'ag-tray-group is-done' + (processedOpen ? ' is-open' : '')}>
+          <button type="button" className="ag-tray-toggle" aria-expanded={processedOpen} onClick={() => setProcessedOpen((open) => !open)}>
+            <ChevronDown size={12} className={processedOpen ? 'is-open' : ''} />
+            {t('Processed ({n})', { n: processed.length })}
+          </button>
+          {processedOpen ? (
+            <div className="ag-tray-list">
+              {processed.map(({ set }) => (
+                <ProcessedLine key={set.id} set={set} />
+              ))}
+            </div>
+          ) : null}
+        </section>
+      ) : null}
+    </div>
+  )
+}
+
+/** While the agent works, a proposal is still a draft: id, files, and a way to throw it away. */
 function DraftLine({ set }: { set: AgentChangeSet }) {
   return (
     <div className="ag-draft">
       <LoaderCircle size={12} className="spin" />
+      <span className="ag-id">#{set.id}</span>
       <span className="ag-draft-title">{set.title}</span>
-      <span className="ag-draft-meta">
-        {t('{n} files', { n: Object.keys(set.files).length })} · {t('Checking and fixing')}
-      </span>
+      <span className="ag-draft-meta">{t('{n} files', { n: Object.keys(set.files).length })}</span>
+      {set.status !== 'applied' ? (
+        <button type="button" className="icon-button icon-button--sm" aria-label={t('Discard')} title={t('Discard draft proposal')} data-tooltip={t('Discard draft proposal')} onClick={() => void discardChangeSet(set)}>
+          <Trash2 size={12} />
+        </button>
+      ) : null}
     </div>
   )
 }
 
 function ChangeSetCard({ set, earlier = [] }: { set: AgentChangeSet; earlier?: AgentChangeSet[] }) {
+  const agent = useAgent()
   const shown = previewing() === set.id
   const files = Object.keys(set.files)
-  const ops = (op: string) => set.changes.filter((c) => op in c).length
-  // Waiting for a decision: open. Applied or rejected: one line, click to open.
-  const [open, setOpen] = useState(set.status === 'proposed')
+  const ops = (op: string) => set.changes.filter((change) => op in change).length
+  const { errors, warnings } = problemCounts(set)
+  const [problemsOpen, setProblemsOpen] = useState(false)
   const [more, setMore] = useState(false)
-  useEffect(() => setOpen(set.status === 'proposed'), [set.status])
   const long = set.summary.length > 160 || set.summary.includes('\n')
+  const askFix = () => {
+    void send(
+      t('Please fix all checker errors in proposal #{id} (“{title}”), or discard it with discard_change_set if it should be replaced cleanly.', { id: set.id, title: set.title }),
+      []
+    )
+  }
   return (
-    <div className={'ag-set is-' + set.status + (open ? ' is-open' : '')}>
-      <button type="button" className="ag-set-head" aria-expanded={open} onClick={() => setOpen((v) => !v)}>
-        <ChevronDown size={12} className={open ? 'is-open' : ''} />
+    <div className={'ag-set is-' + set.status + ' is-open'}>
+      <div className="ag-set-head">
+        <span className="ag-id">#{set.id}</span>
         <span className="ag-set-title">
           {set.requirement ? t('Requirement') + ' · ' : ''}
           {set.title}
         </span>
         {earlier.length ? <span className="ag-set-rev">{t('revised {n} times', { n: earlier.length })}</span> : null}
-        <span className="ag-set-status">{set.status === 'applied' ? t('Applied') : set.status === 'rejected' ? t('Rejected') : t('Proposed')}</span>
-      </button>
-      {!open ? null : (
-        <>
+      </div>
       {set.summary ? (
         <div className="ag-set-summary">
           <p className={'cm-desc' + (long && !more ? ' is-clamped' : '')}>{set.summary}</p>
           {long ? (
-            <button type="button" className="ag-set-more" onClick={() => setMore((v) => !v)}>
+            <button type="button" className="ag-set-more" onClick={() => setMore((value) => !value)}>
               {more ? t('Show less') : t('Show more')}
             </button>
           ) : null}
@@ -541,124 +690,304 @@ function ChangeSetCard({ set, earlier = [] }: { set: AgentChangeSet; earlier?: A
         <span className="is-mod">~{ops('modify')}</span>
         <span className="is-del">−{ops('remove')}</span>
         {files.length ? <span>{t('{n} files', { n: files.length })}</span> : null}
+        {errors ? (
+          <button type="button" className="ag-set-problems is-bad" aria-expanded={problemsOpen} onClick={() => setProblemsOpen((open) => !open)}>
+            {t('{n} errors', { n: errors })}
+          </button>
+        ) : null}
+        {warnings ? (
+          <button type="button" className="ag-set-problems is-warn" aria-expanded={problemsOpen} onClick={() => setProblemsOpen((open) => !open)}>
+            {t('{n} warnings', { n: warnings })}
+          </button>
+        ) : null}
       </div>
+      {problemsOpen && set.problems.length ? (
+        <ul className="ag-set-problem-list">
+          {set.problems.map((problem, index) => (
+            <li key={index} className={problem.level === 'error' ? 'is-bad' : 'is-warn'}>
+              <b>{problem.rule}</b>
+              {problem.where ? <span className="mono"> {problem.where}</span> : null}
+              <span> {problem.msg}</span>
+            </li>
+          ))}
+        </ul>
+      ) : null}
       {files.length ? (
         <details className="ag-set-files">
           <summary>{t('Files')}</summary>
-          {files.map((f) => (
-            <div key={f} className="mono">
-              {f}
+          {files.map((file) => (
+            <div key={file} className="mono">
+              {file}
             </div>
           ))}
         </details>
       ) : null}
-      {set.status === 'proposed' ? (
-        <div className="ag-set-actions">
-          <button type="button" className="button" onClick={() => previewChangeSet(shown ? null : set)}>
-            {shown ? <EyeOff size={13} /> : <Eye size={13} />}
-            {shown ? t('Hide on map') : t('Show on map')}
+      <div className="ag-set-actions">
+        <button type="button" className="button" onClick={() => previewChangeSet(shown ? null : set)}>
+          {shown ? <EyeOff size={13} /> : <Eye size={13} />}
+          {shown ? t('Hide on map') : t('Show on map')}
+        </button>
+        <button type="button" className="button" onClick={() => void discardChangeSet(set)}>
+          <Trash2 size={13} />
+          {t('Discard')}
+        </button>
+        {errors > 0 && !agent.running ? (
+          <button type="button" className="button" onClick={askFix}>
+            {t('Ask AI to fix')}
           </button>
-          <button type="button" className="button" onClick={() => void rejectChangeSet(set)}>
-            <X size={13} />
-            {t('Reject')}
-          </button>
-          <button type="button" className="button button--primary" onClick={() => void applyChangeSet(set)}>
-            <Check size={13} />
-            {set.requirement ? t('Save requirement') : t('Apply')}
-          </button>
-        </div>
-      ) : null}
-        </>
-      )}
+        ) : null}
+        <button type="button" className="button button--primary" disabled={errors > 0} onClick={() => void applyChangeSet(set)}>
+          <Check size={13} />
+          {set.requirement ? t('Save requirement') : t('Apply')}
+        </button>
+      </div>
     </div>
   )
 }
 
-function ModelPicker() {
-  const agent = useAgent()
-  const [models, setModels] = useState<string[] | null>(null)
-  const provider = agent.settings?.providers.find((p) => p.id === agent.settings?.activeProvider)
-  const fallback = agent.settings?.modeModels[agent.mode] || provider?.model || ''
+function ProcessedLine({ set }: { set: AgentChangeSet }) {
   return (
-    <select
-      className="input ag-model"
-      value={agent.model}
-      aria-label={t('Model')}
-      onFocus={() => {
-        if (!models) void window.codemap.agent.models().then(setModels, () => setModels([]))
-      }}
-      onChange={(event) => setModel(event.target.value)}
-    >
-      <option value="">{fallback ? t('Default ({model})', { model: fallback }) : t('Default model')}</option>
-      {(models ?? []).map((m) => (
-        <option key={m} value={m}>
-          {m}
-        </option>
-      ))}
-    </select>
+    <div className={'ag-processed is-' + set.status}>
+      <span className="ag-processed-mark">{set.status === 'applied' ? '✓' : '–'}</span>
+      <span className="ag-id">#{set.id}</span>
+      <span className="ag-processed-title">{set.title}</span>
+      {set.status === 'rejected' ? (
+        <button type="button" className="button ag-sources-add" onClick={() => void discardChangeSet(set)}>
+          {t('Discard')}
+        </button>
+      ) : null}
+    </div>
   )
 }
 
-// Minimal rendering: paragraphs, bullet lines, inline code. Inline code that names a node
-// becomes a link that opens it on the map.
+function providerLabel(provider: AgentProvider): string {
+  if (provider.keySource !== 'local') return provider.name
+  const offline = provider.hasKey === false ? t(' (offline)') : ''
+  if (provider.localSource === 'claude' || provider.id === 'local-gateway') return t('Claude Code Gateway') + offline
+  if (provider.localSource === 'codex' || provider.id === 'local-codex') return t('Codex / Magpie Gateway') + offline
+  return t('Local gateway') + offline
+}
+
+function ProviderModelPicker() {
+  const agent = useAgent()
+  const providers = agent.settings?.providers ?? []
+  const activeProviderId = agent.providerId || agent.settings?.activeProvider || ''
+  const provider = providers.find((item) => item.id === activeProviderId)
+  const [models, setModels] = useState<string[]>([])
+  const [loadedFor, setLoadedFor] = useState('')
+  const fallback = (!agent.providerId || agent.providerId === agent.settings?.activeProvider ? agent.settings?.modeModels[agent.mode] : '') || provider?.model || ''
+  const label = provider ? providerLabel(provider) : t('Provider')
+  const effective = `${label} · ${agent.model || fallback || t('Default model')}`
+  const options = [...models]
+  for (const id of [agent.model, provider?.model || '']) {
+    if (id && !options.includes(id)) options.push(id)
+  }
+
+  useEffect(() => {
+    if (!activeProviderId || provider?.hasKey === false) {
+      setModels([])
+      setLoadedFor(activeProviderId)
+      return
+    }
+    let cancelled = false
+    setModels([])
+    void window.codemap.agent.models(activeProviderId).then(
+      (list) => {
+        if (cancelled) return
+        setModels(list)
+        setLoadedFor(activeProviderId)
+      },
+      () => {
+        if (cancelled) return
+        setModels([])
+        setLoadedFor('')
+      }
+    )
+    return () => {
+      cancelled = true
+    }
+  }, [activeProviderId, provider?.baseUrl, provider?.kind, provider?.hasKey])
+
+  return (
+    <div className="ag-pickers">
+      <select
+        className="input ag-provider"
+        value={activeProviderId}
+        aria-label={t('Provider')}
+        title={effective}
+        data-tooltip={effective}
+        onChange={(event) => {
+          const value = event.target.value
+          if (value === '__settings__') setState({ settingsOpen: true })
+          else void selectProvider(value)
+        }}
+      >
+        {!activeProviderId ? <option value="">{t('Provider')}</option> : null}
+        {providers.map((item) => (
+          <option key={item.id} value={item.id}>
+            {providerLabel(item)}
+          </option>
+        ))}
+        <option value="__settings__">{t('Configure providers…')}</option>
+      </select>
+      <button type="button" className="icon-button icon-button--sm" aria-label={t('Configure providers…')} data-tooltip={t('Configure providers…')} onClick={() => setState({ settingsOpen: true })}>
+        <Settings2 size={13} />
+      </button>
+      <select
+        className="input ag-model"
+        value={agent.model}
+        aria-label={t('Model')}
+        title={effective}
+        data-tooltip={effective}
+        onFocus={() => {
+          if (loadedFor === activeProviderId || !activeProviderId || provider?.hasKey === false) return
+          void window.codemap.agent.models(activeProviderId).then(
+            (list) => {
+              setModels(list)
+              setLoadedFor(activeProviderId)
+            },
+            () => setLoadedFor('')
+          )
+        }}
+        onChange={(event) => setModel(event.target.value)}
+      >
+        <option value="">{fallback ? t('Default ({model})', { model: fallback }) : t('Default model')}</option>
+        {options.map((model) => (
+          <option key={model} value={model}>
+            {model}
+          </option>
+        ))}
+      </select>
+    </div>
+  )
+}
+
+// Conversation text: headings, compact tables, lists, and fenced code stay readable
+// apart from the proposal tray. Inline code that names a node opens it on the map.
 function RichText({ text, onNode }: { text: string; onNode(id: string): void }) {
-  const blocks = text.split(/\n{2,}/)
   return (
     <div className="ag-text">
-      {blocks.map((block, i) => {
-        if (block.startsWith('\u0060\u0060\u0060')) {
-          return (
-            <pre key={i} className="ag-code">
-              {block.replace(/^\u0060\u0060\u0060[^\n]*\n?/, '').replace(/\u0060\u0060\u0060\s*$/, '')}
-            </pre>
-          )
-        }
-        const lines = block.split('\n')
-        if (lines.every((l) => /^\s*([-*]|\d+\.)\s/.test(l))) {
-          return (
-            <ul key={i}>
-              {lines.map((l, j) => (
-                <li key={j}>{inline(l.replace(/^\s*([-*]|\d+\.)\s/, ''), onNode)}</li>
-              ))}
-            </ul>
-          )
-        }
-        return (
-          <p key={i}>
-            {lines.map((l, j) => (
-              <span key={j}>
-                {j ? <br /> : null}
-                {inline(l.replace(/^#+\s*/, ''), onNode)}
-              </span>
-            ))}
-          </p>
-        )
-      })}
+      {renderBlocks(text, onNode)}
     </div>
   )
+}
+
+function renderBlocks(text: string, onNode: (id: string) => void): ReactNode[] {
+  const lines = text.replace(/\r\n/g, '\n').split('\n')
+  const out: ReactNode[] = []
+  let i = 0
+  let key = 0
+  while (i < lines.length) {
+    const line = lines[i]
+    if (!line.trim()) {
+      i++
+      continue
+    }
+    if (line.startsWith('```')) {
+      const body: string[] = []
+      i++
+      while (i < lines.length && !lines[i].startsWith('```')) body.push(lines[i++])
+      if (i < lines.length) i++
+      out.push(
+        <pre key={key++} className="ag-code">
+          {body.join('\n')}
+        </pre>
+      )
+      continue
+    }
+    if (isTableRow(line) && i + 1 < lines.length && /^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$/.test(lines[i + 1])) {
+      const rows = [splitRow(line)]
+      i += 2
+      while (i < lines.length && isTableRow(lines[i])) rows.push(splitRow(lines[i++]))
+      out.push(
+        <div key={key++} className="ag-table-wrap">
+          <table className="ag-table">
+            <tbody>
+              {rows.map((row, rowIndex) => (
+                <tr key={rowIndex}>
+                  {row.map((cell, cellIndex) =>
+                    rowIndex === 0 ? <th key={cellIndex}>{inline(cell, onNode)}</th> : <td key={cellIndex}>{inline(cell, onNode)}</td>
+                  )}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )
+      continue
+    }
+    if (/^#{1,6}\s+/.test(line)) {
+      const level = Math.min(line.match(/^#+/)?.[0].length ?? 3, 4)
+      const Tag = ('h' + level) as 'h1' | 'h2' | 'h3' | 'h4'
+      out.push(
+        <Tag key={key++} className="ag-heading">
+          {inline(line.replace(/^#+\s*/, ''), onNode)}
+        </Tag>
+      )
+      i++
+      continue
+    }
+    if (/^\s*([-*]|\d+\.)\s/.test(line)) {
+      const items: string[] = []
+      while (i < lines.length && /^\s*([-*]|\d+\.)\s/.test(lines[i])) items.push(lines[i++].replace(/^\s*([-*]|\d+\.)\s/, ''))
+      out.push(
+        <ul key={key++}>
+          {items.map((item, itemIndex) => (
+            <li key={itemIndex}>{inline(item, onNode)}</li>
+          ))}
+        </ul>
+      )
+      continue
+    }
+    const paragraph: string[] = []
+    while (i < lines.length && lines[i].trim() && !isBlockStart(lines[i], lines[i + 1])) paragraph.push(lines[i++])
+    out.push(
+      <p key={key++}>
+        {paragraph.map((item, itemIndex) => (
+          <span key={itemIndex}>
+            {itemIndex ? <br /> : null}
+            {inline(item, onNode)}
+          </span>
+        ))}
+      </p>
+    )
+  }
+  return out
+}
+
+function isTableRow(line: string | undefined): boolean {
+  return !!line && line.includes('|') && (line.trim().startsWith('|') || line.split('|').length > 2)
+}
+
+function splitRow(line: string): string[] {
+  return line.trim().replace(/^\||\|$/g, '').split('|').map((cell) => cell.trim())
+}
+
+function isBlockStart(line: string, next: string | undefined): boolean {
+  return line.startsWith('```') || /^#{1,6}\s+/.test(line) || /^\s*([-*]|\d+\.)\s/.test(line) || (isTableRow(line) && !!next && /^\s*\|?\s*:?-{3,}:?/.test(next))
 }
 
 function inline(line: string, onNode: (id: string) => void): ReactNode[] {
   const out: ReactNode[] = []
-  const re = /\u0060([^\u0060]+)\u0060|\*\*([^*]+)\*\*/g
+  const re = /`([^`]+)`|\*\*([^*]+)\*\*/g
   let last = 0
-  let m: RegExpExecArray | null
-  while ((m = re.exec(line))) {
-    if (m.index > last) out.push(line.slice(last, m.index))
-    if (m[1] !== undefined) {
-      const id = m[1]
+  let match: RegExpExecArray | null
+  while ((match = re.exec(line))) {
+    if (match.index > last) out.push(line.slice(last, match.index))
+    if (match[1] !== undefined) {
+      const id = match[1]
       const looksLikeNode = /^[A-Za-z0-9][\w-]*(\.[\w-]+)*$/.test(id) && !/\.(go|ts|js|py|yaml|md)$/.test(id)
       out.push(
         looksLikeNode ? (
-          <button key={m.index} type="button" className="ag-node" onClick={() => onNode(id)}>
+          <button key={match.index} type="button" className="ag-node" onClick={() => onNode(id)}>
             {id}
           </button>
         ) : (
-          <code key={m.index}>{id}</code>
+          <code key={match.index}>{id}</code>
         )
       )
-    } else out.push(<b key={m.index}>{m[2]}</b>)
-    last = m.index + m[0].length
+    } else out.push(<b key={match.index}>{match[2]}</b>)
+    last = match.index + match[0].length
   }
   if (last < line.length) out.push(line.slice(last))
   return out

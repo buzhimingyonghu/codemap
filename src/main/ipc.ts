@@ -1,3 +1,4 @@
+import { readFile } from 'node:fs/promises'
 import path from 'node:path'
 import { app, BrowserWindow, dialog, ipcMain, Menu, type IpcMainInvokeEvent } from 'electron'
 import type { IpcResult } from '../shared/api'
@@ -6,11 +7,12 @@ import { DebugSession } from './dap/debugSession'
 import { CodemapAccess, CodemapWatcher, findLibraries, grantable, isLibrary, loadCodemap, readCodemapFile, resolveFolder, writeCodemapLayout, writeCodemapNode } from './codemap/service'
 import { LspManager } from './lsp/manager'
 import type { AgentSettings, AgentStartRequest } from '../shared/agent'
-import { applyChangeSet, deleteSession, getSession, listSessions, rejectChangeSet, startRun, stopRun } from './agent/runtime'
-import { getAgentSettings, resolveProvider, saveAgentSettings, setProviderKey } from './agent/settings'
+import { applyChangeSet, deleteSession, discardChangeSet, getSession, listSessions, rejectChangeSet, startRun, stopRun } from './agent/runtime'
+import { getAgentSettings, resolveProvider, saveAgentSettings, setProviderKey, testProviderConnection } from './agent/settings'
 import { listModels } from './agent/providers'
 import { knowledgeRoot } from './agent/knowledge'
-import type { LspNavigationKind } from '../shared/lsp'
+import type { LspNavigationKind, LspSymbol } from '../shared/lsp'
+import { isInside } from '../shared/paths'
 import type { SearchQuery } from '../shared/search'
 import { listWorkspaceFiles, mapIndex } from './fileIndex'
 import {
@@ -81,6 +83,93 @@ const search = new SearchService()
 const codemapWatcher = new CodemapWatcher(() => send('codemap:changed', null))
 /** The library loaded last; layout writes are only accepted for its files. */
 let codemapLibrary: string | null = null
+
+const AGENT_LSP_LANGUAGES: Record<string, string> = {
+  '.c': 'c',
+  '.h': 'cpp',
+  '.cc': 'cpp',
+  '.cpp': 'cpp',
+  '.cxx': 'cpp',
+  '.hpp': 'cpp',
+  '.hh': 'cpp',
+  '.m': 'objective-c',
+  '.mm': 'objective-c',
+  '.swift': 'swift',
+  '.rs': 'rust',
+  '.go': 'go',
+  '.py': 'python',
+  '.js': 'javascript',
+  '.mjs': 'javascript',
+  '.cjs': 'javascript',
+  '.jsx': 'javascriptreact',
+  '.ts': 'typescript',
+  '.mts': 'typescript',
+  '.cts': 'typescript',
+  '.tsx': 'typescriptreact'
+}
+
+const AGENT_SYMBOL_KINDS = [
+  'file', 'module', 'namespace', 'package', 'class', 'method', 'property', 'field', 'constructor',
+  'enum', 'interface', 'function', 'variable', 'constant', 'string', 'number', 'boolean', 'array',
+  'object', 'key', 'null', 'enumMember', 'struct', 'event', 'operator', 'typeParameter'
+]
+
+function formatAgentSymbols(symbols: LspSymbol[], depth = 0): string[] {
+  const lines: string[] = []
+  for (const symbol of symbols) {
+    const kind = AGENT_SYMBOL_KINDS[symbol.kind - 1] ?? 'symbol'
+    lines.push(`${'  '.repeat(depth)}${kind} ${symbol.name} [L${symbol.line}-L${symbol.endLine}]`)
+    if (symbol.children?.length) lines.push(...formatAgentSymbols(symbol.children, depth + 1))
+  }
+  return lines
+}
+
+async function ensureAgentLspOpen(file: string): Promise<boolean> {
+  const root = getWorkspaceRoot()
+  if (!root || !isInside(root, file)) return false
+  const languageId = AGENT_LSP_LANGUAGES[path.extname(file).toLowerCase()]
+  if (!languageId) return false
+  try {
+    const text = await readFile(file, 'utf8')
+    return await lsp.open(file, languageId, text)
+  } catch {
+    return false
+  }
+}
+
+const electronAgentLsp = {
+  async symbols(file: string): Promise<string> {
+    if (!(await ensureAgentLspOpen(file))) return '(no symbols)'
+    const symbols = await lsp.symbols(file)
+    return symbols.length ? formatAgentSymbols(symbols).join('\n') : '(no symbols)'
+  },
+  async navigate(kind: 'definition' | 'implementation' | 'references', file: string, line: number, column: number): Promise<string> {
+    if (!(await ensureAgentLspOpen(file))) return `(no ${kind})`
+    const locations = await lsp.navigate(kind, file, line, column)
+    const seen = new Set<string>()
+    const out: string[] = []
+    for (const loc of locations) {
+      const key = `${loc.path}:${loc.line}:${loc.column}`
+      if (seen.has(key)) continue
+      seen.add(key)
+      let preview = ''
+      try {
+        const src = await readFile(loc.path, 'utf8')
+        preview = (src.split(/\r?\n/)[loc.line - 1] ?? '').trim().slice(0, 160)
+      } catch {
+        /* ignore unreadable target */
+      }
+      out.push(`${loc.path}:${loc.line}:${loc.column}${preview ? `  ${preview}` : ''}`)
+      if (out.length >= 40) break
+    }
+    return out.length ? out.join('\n') : `(no ${kind})`
+  },
+  async hover(file: string, line: number, column: number): Promise<string> {
+    if (!(await ensureAgentLspOpen(file))) return '(no hover)'
+    const hover = await lsp.hover(file, line, column)
+    return hover?.contents.length ? hover.contents.join('\n\n') : '(no hover)'
+  }
+}
 // Grants load on first use: settings must not be read before index.ts picks the user-data folder.
 let grantsLoaded: Promise<void> | null = null
 function ensureGrants(): Promise<void> {
@@ -490,9 +579,12 @@ export function registerIpc(): void {
     const { provider, key } = await resolveProvider(providerId ?? null)
     return listModels(provider, key)
   })
+  handle('agent:testConnection', (_event, providerId?: string | null, model?: string) =>
+    testProviderConnection(providerId ? String(providerId) : null, model ? String(model) : undefined)
+  )
   handle('agent:start', async (_event, request: AgentStartRequest) => {
     await ensureGrants()
-    return startRun(requireLibrary(), codemapAccess, request, (event) => send('agent:event', event))
+    return startRun(requireLibrary(), codemapAccess, request, (event) => send('agent:event', event), { lsp: electronAgentLsp })
   })
   handle('agent:stop', (_event, sessionId: string) => stopRun(String(sessionId)))
   handle('agent:sessions', () => (codemapLibrary ? listSessions(codemapLibrary) : []))
@@ -502,6 +594,7 @@ export function registerIpc(): void {
     applyChangeSet(requireLibrary(), getWorkspaceRoot(), String(sessionId), String(changeSetId))
   )
   handle('agent:rejectChangeSet', (_event, sessionId: string, changeSetId: string) => rejectChangeSet(requireLibrary(), String(sessionId), String(changeSetId)))
+  handle('agent:discardChangeSet', (_event, sessionId: string, changeSetId: string) => discardChangeSet(requireLibrary(), String(sessionId), String(changeSetId), (event) => send('agent:event', event)))
   handle('agent:knowledgeDir', () => knowledgeRoot())
   // Picking in the system dialog is the permission to read (like codemap:pickRepository).
   const grantPicked = async (folders: string[]) => {

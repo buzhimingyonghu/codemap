@@ -7,6 +7,7 @@ import { isInside } from '../../shared/paths'
 import { loadLibrary } from '../codemap/loadLibrary.mjs'
 import type { CodemapAccess } from '../codemap/service'
 import { knowledgeRoot } from './knowledge'
+import { scanRepoEntrypoints } from './repoScanner'
 import type { ToolSpec } from './providers'
 
 // The agent's tools. Everything is read-only except propose_change_set, which only records a
@@ -16,10 +17,18 @@ export interface ToolEnv {
   library: string
   access: CodemapAccess
   mode: AgentMode
+  /** Optional language service. Present only when the host can answer semantic queries. */
+  lsp?: {
+    symbols(file: string): Promise<string>
+    navigate(kind: 'definition' | 'implementation' | 'references', file: string, line: number, column: number): Promise<string>
+    hover?(file: string, line: number, column: number): Promise<string>
+  }
   /** Lets the map follow the agent (focus a node, open a map, select a flow). */
   focus(map: string | null, nodes: string[], flow?: string | null, note?: string): void
-  /** New proposal, or with extend: add files and changes to a proposal not yet applied (checked as a whole). */
-  propose(set: Omit<AgentChangeSet, 'id' | 'sessionId' | 'problems' | 'status'>, extend?: string): AgentChangeSet
+  /** New proposal, or with extend: add files and changes to a proposal not yet applied (checked as a whole). replaceChanges drops the earlier changes[]. */
+  propose(set: Omit<AgentChangeSet, 'id' | 'sessionId' | 'problems' | 'status'>, extend?: string, replaceChanges?: boolean): AgentChangeSet
+  /** Drops an unapplied draft. Library YAML is not touched. */
+  discard(id: string, reason?: string): Promise<{ id: string; title: string }>
   /** Create mode: stop at a review gate. */
   gate(stage: string, summary: string): void
   /** Create mode: run sub-agents for several nodes at once (resolves when all finished). */
@@ -162,12 +171,46 @@ async function* walk(dir: string, depth = 0): AsyncGenerator<string> {
 // ---------- Change set checking ----------
 
 /** Validates a change set against the library: applies it like a requirement and reports new problems. */
-export function checkChangeSet(library: string, set: Pick<AgentChangeSet, 'changes' | 'files'>): AgentChangeSet['problems'] {
+export function checkChangeSet(
+  library: string,
+  set: Pick<AgentChangeSet, 'changes' | 'files'>,
+  peerSets?: Array<Pick<AgentChangeSet, 'changes' | 'files'>>
+): AgentChangeSet['problems'] {
   const loaded = loadLibrary(library)
-  const docs = [...loaded.docs]
-  const links = [...loaded.links]
+  const layered = layerFiles(loaded.docs, loaded.links, peerSets ?? [])
+  const docs = layered.docs
+  const links = layered.links
   const problems: AgentChangeSet['problems'] = []
-  for (const [rel, text] of Object.entries(set.files ?? {})) {
+  applyFiles(docs, links, set.files ?? {}, problems)
+  const base = checkLibrary(layered.baseDocs, layered.baseLinks)
+  const baseKeys = new Set(base.base.issues.map(issueKey))
+  const req = { file: '(proposed change set)', requirement: { id: 'proposal', name: 'proposal' }, changes: set.changes ?? [] }
+  const after = checkLibrary(docs, set.changes?.length ? [req] : [], links)
+  const issues = set.changes?.length ? after.reqs[0].issues.concat(after.reqs[0].problems) : after.base.issues.filter((i) => !baseKeys.has(issueKey(i)))
+  for (const i of issues) if (i.level !== 'info') problems.push({ level: i.level, rule: i.rule, where: i.where, msg: i.msg })
+  return problems
+}
+
+/** Puts other unapplied proposals under the one being checked, so siblings can refer to each other. */
+function layerFiles(
+  sourceDocs: Array<{ file: string; node: Record<string, any> }>,
+  sourceLinks: Array<{ file: string; data: Record<string, any> }>,
+  peers: Array<Pick<AgentChangeSet, 'changes' | 'files'>>
+): { docs: Array<{ file: string; node: Record<string, any> }>; links: Array<{ file: string; data: Record<string, any> }>; baseDocs: Array<{ file: string; node: Record<string, any> }>; baseLinks: Array<{ file: string; data: Record<string, any> }> } {
+  const docs = [...sourceDocs]
+  const links = [...sourceLinks]
+  for (const peer of peers) applyFiles(docs, links, peer.files ?? {}, [])
+  return { docs, links, baseDocs: peers.length ? docs.map((doc) => ({ ...doc })) : sourceDocs, baseLinks: peers.length ? links.map((link) => ({ ...link })) : sourceLinks }
+}
+
+function applyFiles(
+  docs: Array<{ file: string; node: Record<string, any> }>,
+  links: Array<{ file: string; data: Record<string, any> }>,
+  files: Record<string, string> | Array<[string, string]>,
+  problems: AgentChangeSet['problems']
+): void {
+  const entries = Array.isArray(files) ? files : Object.entries(files)
+  for (const [rel, text] of entries) {
     if (!/\.(ya?ml)$/.test(rel)) continue
     let data: any
     try {
@@ -178,22 +221,24 @@ export function checkChangeSet(library: string, set: Pick<AgentChangeSet, 'chang
     }
     if (!data || typeof data !== 'object') continue
     if (data.owner && data.links) {
-      const i = links.findIndex((l) => l.file === rel)
+      const i = links.findIndex((item) => item.file === rel)
       if (i >= 0) links.splice(i, 1, { file: rel, data })
       else links.push({ file: rel, data })
     } else if (data.id) {
-      const i = docs.findIndex((d) => d.file === rel)
+      const i = docs.findIndex((item) => item.file === rel)
       if (i >= 0) docs.splice(i, 1, { file: rel, node: data })
       else docs.push({ file: rel, node: data })
     }
   }
-  const base = checkLibrary(loaded.docs, [], loaded.links)
-  const baseKeys = new Set(base.base.issues.map(issueKey))
-  const req = { file: '(proposed change set)', requirement: { id: 'proposal', name: 'proposal' }, changes: set.changes ?? [] }
-  const after = checkLibrary(docs, set.changes?.length ? [req] : [], links)
-  const issues = set.changes?.length ? after.reqs[0].issues.concat(after.reqs[0].problems) : after.base.issues.filter((i) => !baseKeys.has(issueKey(i)))
-  for (const i of issues) if (i.level !== 'info') problems.push({ level: i.level, rule: i.rule, where: i.where, msg: i.msg })
-  return problems
+}
+
+function allowedSemantic(env: ToolEnv, file: string): string {
+  const resolved = path.resolve(file)
+  if (!env.access.allowed(resolved) && !isInside(env.library, resolved)) {
+    throw new Error(`Not allowed to inspect ${resolved}: it is outside the open folder and the node library.`)
+  }
+  if (!env.lsp) throw new Error('No language service is connected')
+  return resolved
 }
 
 // ---------- Tool table ----------
@@ -471,6 +516,7 @@ const TOOLS: ToolDef[] = [
           changes: { type: 'array', items: { type: 'object' } },
           files: { type: 'object', additionalProperties: { type: 'string' } },
           extend: { type: 'string', description: 'Id of an earlier proposal (not applied yet) to add these files and changes to' },
+          replaceChanges: { type: 'boolean', description: 'When used with extend, replaces the earlier changes[] list instead of appending to it.' },
           requirement: { type: 'object', properties: { id: { type: 'string' }, name: { type: 'string' }, desc: { type: 'string' } } }
         },
         required: ['title', 'summary']
@@ -491,13 +537,56 @@ const TOOLS: ToolDef[] = [
         changes: Array.isArray(i.changes) ? i.changes : [],
         files,
         requirement: env.mode === 'require' && i.requirement ? { id: str(i.requirement.id) || 'requirement', name: str(i.requirement.name) || str(i.title), desc: str(i.requirement.desc) || undefined } : undefined
-      }, i.extend ? str(i.extend) : undefined)
+      }, i.extend ? str(i.extend) : undefined, Boolean(i.replaceChanges))
       const errors = set.problems.filter((p) => p.level === 'error')
       const head = `Proposal ${set.id} (${Object.keys(set.files).length} files, ${set.changes.length} changes) recorded as a draft; the user sees it only when you finish.`
       const text = set.problems.length
         ? `${head}\nChecker problems so far:\n${set.problems.map((p) => `${p.level} [${p.rule}] ${p.where}: ${p.msg}`).join('\n')}\nIf you are still writing this map, keep going and add the rest with extend: \"${set.id}\". Once everything is written, fix all of these together in one extend call (each error says how), not one by one.`
         : `${head} The checker found no problems.`
       return { ok: true, content: clip(text), summary: errors.length ? `${errors.length} errors` : 'no new problems' }
+    }
+  },
+  {
+    spec: {
+      name: 'scan_repo_entrypoints',
+      description: 'Walks a repository and returns every sync entrypoint (HTTP/RPC/IPC/CLI), async consumer, timer, storage client, and git remote. Prefer this over search_code when building a map so entrypoints are not capped at 80 hits.',
+      schema: {
+        type: 'object',
+        properties: {
+          path: { type: 'string', description: 'Repository folder path to scan for all sync/async entrypoints, timers, storage, and git remote metadata' },
+          targetFolder: { type: 'string', description: 'Optional node folder inside the library (e.g. "order-svc") to compute exact repo.local relative path' }
+        },
+        required: ['path']
+      }
+    },
+    modes: 'all',
+    label: (i) => `Scan entrypoints ${path.basename(str(i.path)) || str(i.path)}`,
+    run: async (env, i) => {
+      const dir = path.isAbsolute(str(i.path)) ? str(i.path) : path.resolve(env.library, str(i.path))
+      if (!env.access.allowed(dir) && !isInside(env.library, dir)) throw new Error(`Not allowed to scan ${dir}`)
+      const report = await scanRepoEntrypoints(dir, env.library, i.targetFolder ? str(i.targetFolder) : undefined)
+      return ok(report, 'repo entrypoints')
+    }
+  },
+  {
+    spec: {
+      name: 'discard_change_set',
+      description: 'Discards an unapplied draft proposal. Library YAML files are not modified. Use this when a draft cannot be fixed, then propose a clean one and say which #id and title was discarded.',
+      schema: {
+        type: 'object',
+        properties: {
+          id: { type: 'string', description: 'Proposal id to discard (must not be applied yet)' },
+          reason: { type: 'string', description: 'Why this draft is being discarded' }
+        },
+        required: ['id']
+      }
+    },
+    modes: ['adjust', 'create', 'require'],
+    label: (i) => `Discard proposal #${i.id}`,
+    run: async (env, i) => {
+      const dropped = await env.discard(str(i.id), i.reason ? str(i.reason) : undefined)
+      const why = i.reason ? ` Reason: ${str(i.reason)}` : ''
+      return ok(`Discarded proposal #${dropped.id} (${dropped.title}). Library YAML files were untouched.${why}`, `#${dropped.id} ${dropped.title}`)
     }
   },
   {
@@ -533,11 +622,60 @@ const TOOLS: ToolDef[] = [
       const report = await env.delegate(tasks)
       return ok(report, `${tasks.length} sub-agents finished`)
     }
+  },
+  {
+    spec: {
+      name: 'lsp_symbols',
+      description: 'Lists the symbols (functions, types, classes) in one source file through the connected language service. Read-only.',
+      schema: { type: 'object', properties: { file: { type: 'string', description: 'Absolute path of a source file' } }, required: ['file'] }
+    },
+    modes: 'all',
+    label: (i) => `Symbols in ${path.basename(str(i.file))}`,
+    run: async (env, i) => {
+      const file = allowedSemantic(env, str(i.file))
+      return ok(await env.lsp!.symbols(file), path.basename(file))
+    }
+  },
+  {
+    spec: {
+      name: 'lsp_definitions',
+      description: 'Finds the definition of the symbol at a file position through the connected language service. Read-only. line and column are 1-based.',
+      schema: {
+        type: 'object',
+        properties: { file: { type: 'string' }, line: { type: 'number' }, column: { type: 'number' } },
+        required: ['file', 'line', 'column']
+      }
+    },
+    modes: 'all',
+    label: (i) => `Definition at ${path.basename(str(i.file))}:${i.line}`,
+    run: async (env, i) => {
+      const file = allowedSemantic(env, str(i.file))
+      return ok(await env.lsp!.navigate('definition', file, Number(i.line), Number(i.column)), `${path.basename(file)}:${i.line}`)
+    }
+  },
+  {
+    spec: {
+      name: 'lsp_references',
+      description: 'Finds references of the symbol at a file position through the connected language service. Read-only. line and column are 1-based.',
+      schema: {
+        type: 'object',
+        properties: { file: { type: 'string' }, line: { type: 'number' }, column: { type: 'number' } },
+        required: ['file', 'line', 'column']
+      }
+    },
+    modes: 'all',
+    label: (i) => `References at ${path.basename(str(i.file))}:${i.line}`,
+    run: async (env, i) => {
+      const file = allowedSemantic(env, str(i.file))
+      return ok(await env.lsp!.navigate('references', file, Number(i.line), Number(i.column)), `${path.basename(file)}:${i.line}`)
+    }
   }
 ]
 
-export function toolsFor(mode: AgentMode, allowDelegate = true): ToolDef[] {
-  return TOOLS.filter((t) => (t.modes === 'all' || t.modes.includes(mode)) && (allowDelegate || t.spec.name !== 'delegate_nodes'))
+const LSP_TOOLS = new Set(['lsp_symbols', 'lsp_definitions', 'lsp_references'])
+
+export function toolsFor(mode: AgentMode, allowDelegate = true, opts?: { lsp?: boolean }): ToolDef[] {
+  return TOOLS.filter((t) => (t.modes === 'all' || t.modes.includes(mode)) && (allowDelegate || t.spec.name !== 'delegate_nodes') && (opts?.lsp || !LSP_TOOLS.has(t.spec.name)))
 }
 
 export async function runTool(defs: ToolDef[], env: ToolEnv, name: string, input: Record<string, any>): Promise<ToolResult> {

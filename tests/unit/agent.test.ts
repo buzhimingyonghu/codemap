@@ -33,7 +33,8 @@ const env = (library: string, mode: 'ask' | 'adjust' = 'ask') => {
         proposals.push(set)
         return set as never
       },
-      gate: () => undefined
+      gate: () => undefined,
+      discard: async (id: string) => ({ id, title: 'draft' })
     }
   }
 }
@@ -88,6 +89,55 @@ describe('agent tools', () => {
     const yamlError = checkChangeSet(lib, { changes: [], files: { 'y/y.yaml': 'id: [' } })
     expect(yamlError[0].rule).toBe('yaml')
   })
+
+  it('layers sibling proposals before checking the current one', () => {
+    const lib = copyLibrary()
+    const sibling = {
+      changes: [],
+      files: {
+        'warehouse-system/wms/wms.yaml': ['schema: codemap/v1', 'id: warehouse-system.wms', 'kind: component', 'name: 仓储服务', 'contains:', '  - { id: inbound, kind: component, name: 入库 }'].join('\n')
+      }
+    }
+    const parent = {
+      changes: [],
+      files: {
+        'warehouse-system/warehouse-system.yaml': [
+          'schema: codemap/v1', 'id: warehouse-system', 'kind: component', 'name: 仓储系统', 'review: { status: draft }',
+          'contains:', '  - warehouse-system.wms', '  - inventory-svc',
+          'edges:', '  - { from: warehouse-system.wms, to: inventory-svc, kind: call, name: 入库加库存, via: inventory-svc.AddStock }'
+        ].join('\n')
+      }
+    }
+    expect(checkChangeSet(lib, parent).some((problem) => problem.rule === 'ref-missing')).toBe(true)
+    expect(checkChangeSet(lib, parent, [sibling]).filter((problem) => problem.level === 'error')).toEqual([])
+  })
+
+  it('offers semantic tools only when a language service is connected', async () => {
+    const lib = copyLibrary()
+    const file = path.join(lib, '../demo-repos/order-svc/handler/order.go')
+    expect(toolsFor('ask').some((tool) => tool.spec.name.startsWith('lsp_'))).toBe(false)
+    const defs = toolsFor('ask', true, { lsp: true })
+    const seen: string[] = []
+    const { env: e } = env(lib)
+    const connected = {
+      ...e,
+      lsp: {
+      symbols: async (target: string) => {
+        seen.push(target)
+        return 'CreateOrder'
+      },
+      navigate: async (kind: string, target: string, line: number, column: number) => `${kind} ${target}:${line}:${column}`
+      }
+    }
+    const symbols = await runTool(defs, connected, 'lsp_symbols', { file })
+    expect(symbols.ok).toBe(true)
+    expect(symbols.content).toContain('CreateOrder')
+    expect(seen[0]).toBe(path.resolve(file))
+    const refs = await runTool(defs, connected, 'lsp_references', { file, line: 19, column: 2 })
+    expect(refs.content).toContain('references')
+    const denied = await runTool(defs, connected, 'lsp_definitions', { file: '/etc/hosts', line: 1, column: 1 })
+    expect(denied.ok).toBe(false)
+  })
 })
 
 describe('agent prompts', () => {
@@ -108,6 +158,30 @@ describe('agent prompts', () => {
     expect(sys).toContain('order-svc.save')
     expect(sys).toContain('回答时先说结论')
   })
+
+  it('puts git remote, repo.local, domain notes, and the build tier into the create prompt', async () => {
+    const lib = copyLibrary()
+    const repo = mkdtempSync(path.join(tmpdir(), 'codemap-prompt-repo-'))
+    mkdirSync(path.join(repo, '.git'), { recursive: true })
+    writeFileSync(path.join(repo, '.git', 'config'), '[remote "origin"]\n\turl = git@git.example.com:shop/order.git\n')
+    writeFileSync(path.join(lib, 'domain.md'), '订单域：先扣库存再创建订单。')
+    const sys = await systemPrompt(lib, 'create', {
+      stack: [],
+      selected: [],
+      flow: null,
+      repos: [repo],
+      output: 'order-svc',
+      buildTier: 'balanced',
+      buildLens: 'service'
+    })
+    expect(sys).toContain('git@git.example.com:shop/order.git')
+    expect(sys).toContain('local:')
+    expect(sys).toContain('订单域：先扣库存再创建订单。')
+    expect(sys).toContain('Build tier: balanced')
+    expect(sys).toContain('Build lens: service')
+    expect(sys).toContain('scan_repo_entrypoints')
+  })
+
 })
 
 describe('merge into base', () => {
