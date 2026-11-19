@@ -256,8 +256,9 @@ async function runLoop(s: Session, access: CodemapAccess, req: AgentStartRequest
   s.messages.push(reply)
   let reason: AgentEndReason = 'end'
   try {
-    const { provider, key } = await resolveProvider()
-    const model = req.model || settings.modeModels[s.mode] || provider.model
+    const { provider, key } = await resolveProvider(req.providerId)
+    const settingsModel = !req.providerId || req.providerId === settings.activeProvider ? settings.modeModels[s.mode] : undefined
+    const model = req.model || settingsModel || provider.model
     if (!model) throw new Error(`No model chosen for ${provider.name}: pick one in Settings → AI`)
     const runSets = new Set<string>()
     let fixNudges = 0

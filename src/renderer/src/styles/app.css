@@ -5857,6 +5857,7 @@ button.status-item:hover {
   display: inline-flex;
   align-items: center;
   gap: 5px;
+  flex: 0 0 auto;
 }
 .ag-gate {
   display: flex;
@@ -5909,13 +5910,40 @@ button.status-item:hover {
 }
 .ag-compose-bar {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 8px;
 }
+.ag-pickers {
+  display: flex;
+  flex: 1 1 180px;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+.ag-provider,
 .ag-model {
-  flex: 1;
+  flex: 1 1 7rem;
+  width: auto;
   min-width: 0;
   height: 26px;
+  font-size: var(--font-size-tiny);
+}
+.ag-compose-bar > .button:last-child {
+  margin-left: auto;
+}
+.ai-provider-endpoint {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.ai-kind {
+  flex: 0 0 auto;
+  padding: 1px 6px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 999px;
+  color: var(--fg-muted);
   font-size: var(--font-size-tiny);
 }
 .ag-usage {

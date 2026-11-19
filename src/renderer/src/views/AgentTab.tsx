@@ -1,6 +1,6 @@
-import { BookOpen, Check, ChevronDown, CircleAlert, CircleCheck, CircleSlash, Eye, EyeOff, FolderGit2, FolderOutput, History, Link2, LoaderCircle, MessageSquarePlus, Plus, Send, Sparkles, Square, Trash2, X } from 'lucide-react'
+import { BookOpen, Check, ChevronDown, CircleAlert, CircleCheck, CircleSlash, Eye, EyeOff, FolderGit2, FolderOutput, History, Link2, LoaderCircle, MessageSquarePlus, Plus, Send, Settings2, Sparkles, Square, Trash2, X } from 'lucide-react'
 import { useEffect, useRef, useState, type ReactNode } from 'react'
-import { AGENT_MODES, type AgentChangeSet, type AgentEndReason, type AgentMode, type AgentStepView } from '@shared/agent'
+import { AGENT_MODES, type AgentChangeSet, type AgentEndReason, type AgentMode, type AgentProvider, type AgentStepView } from '@shared/agent'
 import { t } from '../lib/i18n'
 import {
   addLink,
@@ -18,6 +18,7 @@ import {
   rejectChangeSet,
   restoreSession,
   send,
+  selectProvider,
   setMode,
   setModel,
   setOutput,
@@ -330,7 +331,7 @@ export function AgentTab({ selected, onFocusNode }: { selected: string | null; o
           </ul>
         ) : null}
         <div className="ag-compose-bar">
-          <ModelPicker />
+          <ProviderModelPicker />
           {agent.usage.input ? (
             <span className="ag-usage" data-tooltip={t('Tokens used in this conversation')}>
               {Math.round(agent.usage.input / 1000)}k / {Math.round(agent.usage.output / 1000)}k
@@ -574,28 +575,105 @@ function ChangeSetCard({ set, earlier = [] }: { set: AgentChangeSet; earlier?: A
   )
 }
 
-function ModelPicker() {
+function providerLabel(provider: AgentProvider): string {
+  if (provider.keySource !== 'local') return provider.name
+  const offline = provider.hasKey === false ? t(' (offline)') : ''
+  if (provider.localSource === 'claude' || provider.id === 'local-gateway') return t('Claude Code Gateway') + offline
+  if (provider.localSource === 'codex' || provider.id === 'local-codex') return t('Codex / Magpie Gateway') + offline
+  return t('Local gateway') + offline
+}
+
+function ProviderModelPicker() {
   const agent = useAgent()
-  const [models, setModels] = useState<string[] | null>(null)
-  const provider = agent.settings?.providers.find((p) => p.id === agent.settings?.activeProvider)
-  const fallback = agent.settings?.modeModels[agent.mode] || provider?.model || ''
+  const providers = agent.settings?.providers ?? []
+  const activeProviderId = agent.providerId || agent.settings?.activeProvider || ''
+  const provider = providers.find((item) => item.id === activeProviderId)
+  const [models, setModels] = useState<string[]>([])
+  const [loadedFor, setLoadedFor] = useState('')
+  const fallback = (!agent.providerId || agent.providerId === agent.settings?.activeProvider ? agent.settings?.modeModels[agent.mode] : '') || provider?.model || ''
+  const label = provider ? providerLabel(provider) : t('Provider')
+  const effective = `${label} · ${agent.model || fallback || t('Default model')}`
+  const options = [...models]
+  for (const id of [agent.model, provider?.model || '']) {
+    if (id && !options.includes(id)) options.push(id)
+  }
+
+  useEffect(() => {
+    if (!activeProviderId || provider?.hasKey === false) {
+      setModels([])
+      setLoadedFor(activeProviderId)
+      return
+    }
+    let cancelled = false
+    setModels([])
+    void window.codemap.agent.models(activeProviderId).then(
+      (list) => {
+        if (cancelled) return
+        setModels(list)
+        setLoadedFor(activeProviderId)
+      },
+      () => {
+        if (cancelled) return
+        setModels([])
+        setLoadedFor('')
+      }
+    )
+    return () => {
+      cancelled = true
+    }
+  }, [activeProviderId, provider?.baseUrl, provider?.kind, provider?.hasKey])
+
   return (
-    <select
-      className="input ag-model"
-      value={agent.model}
-      aria-label={t('Model')}
-      onFocus={() => {
-        if (!models) void window.codemap.agent.models().then(setModels, () => setModels([]))
-      }}
-      onChange={(event) => setModel(event.target.value)}
-    >
-      <option value="">{fallback ? t('Default ({model})', { model: fallback }) : t('Default model')}</option>
-      {(models ?? []).map((m) => (
-        <option key={m} value={m}>
-          {m}
-        </option>
-      ))}
-    </select>
+    <div className="ag-pickers">
+      <select
+        className="input ag-provider"
+        value={activeProviderId}
+        aria-label={t('Provider')}
+        title={effective}
+        data-tooltip={effective}
+        onChange={(event) => {
+          const value = event.target.value
+          if (value === '__settings__') setState({ settingsOpen: true })
+          else void selectProvider(value)
+        }}
+      >
+        {!activeProviderId ? <option value="">{t('Provider')}</option> : null}
+        {providers.map((item) => (
+          <option key={item.id} value={item.id}>
+            {providerLabel(item)}
+          </option>
+        ))}
+        <option value="__settings__">{t('Configure providers…')}</option>
+      </select>
+      <button type="button" className="icon-button icon-button--sm" aria-label={t('Configure providers…')} data-tooltip={t('Configure providers…')} onClick={() => setState({ settingsOpen: true })}>
+        <Settings2 size={13} />
+      </button>
+      <select
+        className="input ag-model"
+        value={agent.model}
+        aria-label={t('Model')}
+        title={effective}
+        data-tooltip={effective}
+        onFocus={() => {
+          if (loadedFor === activeProviderId || !activeProviderId || provider?.hasKey === false) return
+          void window.codemap.agent.models(activeProviderId).then(
+            (list) => {
+              setModels(list)
+              setLoadedFor(activeProviderId)
+            },
+            () => setLoadedFor('')
+          )
+        }}
+        onChange={(event) => setModel(event.target.value)}
+      >
+        <option value="">{fallback ? t('Default ({model})', { model: fallback }) : t('Default model')}</option>
+        {options.map((model) => (
+          <option key={model} value={model}>
+            {model}
+          </option>
+        ))}
+      </select>
+    </div>
   )
 }
 

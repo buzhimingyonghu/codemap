@@ -1,6 +1,6 @@
 import { useSyncExternalStore } from 'react'
 import yaml from 'js-yaml'
-import type { AgentChangeSet, AgentContext, AgentEndReason, AgentEvent, AgentMessageView, AgentMode, AgentPhase, AgentSessionInfo, AgentSessionSummary, AgentSettings, AgentStepView } from '@shared/agent'
+import type { AgentChangeSet, AgentContext, AgentEndReason, AgentEvent, AgentMessageView, AgentMode, AgentPhase, AgentSessionInfo, AgentSessionSummary, AgentSettings, AgentStartRequest, AgentStepView } from '@shared/agent'
 import { t } from '../lib/i18n'
 import { createLibrary, getCodeMap, reloadCodeMap, setNavigation, setPreview, previewId, type PreviewSet } from './codeMap'
 import { notify, reportError } from './ui'
@@ -38,6 +38,8 @@ export interface AgentState {
   usage: { input: number; output: number }
   sessions: AgentSessionSummary[]
   settings: AgentSettings | null
+  /** Provider override for the next run (empty: follow settings.activeProvider). */
+  providerId: string
   /** Model override for the next run (empty: the mode's default). */
   model: string
   /** Repositories and knowledge picked for this conversation. */
@@ -70,6 +72,7 @@ const EMPTY: AgentState = {
   usage: { input: 0, output: 0 },
   sessions: [],
   settings: null,
+  providerId: '',
   model: '',
   repos: [],
   docs: [],
@@ -77,7 +80,12 @@ const EMPTY: AgentState = {
   version: 0
 }
 
-let state: AgentState = { ...EMPTY, mode: (localStorage.getItem('agent.mode') as AgentMode) || 'ask' }
+let state: AgentState = {
+  ...EMPTY,
+  mode: (localStorage.getItem('agent.mode') as AgentMode) || 'ask',
+  providerId: localStorage.getItem('agent.providerId') || '',
+  model: localStorage.getItem('agent.model') || ''
+}
 
 // Each mode keeps its own conversation: switching modes goes back to that mode's last one.
 const LAST_KEY = 'agent.lastSession'
@@ -150,7 +158,25 @@ export async function restoreSession(): Promise<void> {
 }
 
 export function setModel(model: string): void {
+  if (model) localStorage.setItem('agent.model', model)
+  else localStorage.removeItem('agent.model')
   update({ model })
+}
+
+/** Switches the chat-bar provider and clears a model chosen for the previous one. */
+export async function selectProvider(providerId: string, options?: { keepModel?: boolean }): Promise<void> {
+  localStorage.setItem('agent.providerId', providerId)
+  if (!options?.keepModel) localStorage.removeItem('agent.model')
+  update(options?.keepModel ? { providerId } : { providerId, model: '' })
+  const settings = state.settings
+  if (!settings || !providerId || !settings.providers.some((provider) => provider.id === providerId)) return
+  if (settings.activeProvider === providerId) return
+  try {
+    const saved = await window.codemap.agent.saveSettings({ ...settings, activeProvider: providerId })
+    update({ settings: saved })
+  } catch (error) {
+    reportError(error, t('Cannot save AI settings'))
+  }
 }
 
 // ---------- Sources ----------
@@ -278,10 +304,23 @@ export async function deleteSession(id: string): Promise<void> {
 export async function loadAgentSettings(): Promise<AgentSettings | null> {
   try {
     const settings = await window.codemap.agent.settings()
-    update({ settings })
+    const providerId = state.providerId && settings.providers.some((provider) => provider.id === state.providerId) ? state.providerId : ''
+    if (providerId !== state.providerId) localStorage.setItem('agent.providerId', providerId)
+    update({ settings, providerId })
     return settings
   } catch {
     return null
+  }
+}
+
+function startRequest(message: string, selected: string[]): AgentStartRequest {
+  return {
+    mode: state.mode,
+    message,
+    context: contextNow(selected),
+    sessionId: state.sessionId ?? undefined,
+    model: state.model || undefined,
+    providerId: state.providerId || state.settings?.activeProvider || undefined
   }
 }
 
@@ -306,7 +345,7 @@ export async function send(message: string, selected: string[] = []): Promise<vo
     messages.splice(at, 0, { role: 'user', text, at: Date.now() })
     update({ messages })
     try {
-      await window.codemap.agent.start({ mode: state.mode, message: text, context: contextNow(selected), sessionId: state.sessionId, model: state.model || undefined })
+      await window.codemap.agent.start(startRequest(text, selected))
     } catch (error) {
       reportError(error, t('Cannot send the message'))
     }
@@ -335,7 +374,7 @@ export async function send(message: string, selected: string[] = []): Promise<vo
     messages: [...state.messages, { role: 'user', text, at: Date.now() }, assistant]
   })
   try {
-    const sessionId = await window.codemap.agent.start({ mode, message: text, context: contextNow(selected), sessionId: state.sessionId ?? undefined, model: state.model || undefined })
+    const sessionId = await window.codemap.agent.start({ ...startRequest(text, selected), mode })
     if (!state.sessionId) update({ sessionId })
     rememberSession(mode, sessionId)
   } catch (error) {

@@ -21,6 +21,8 @@ export interface AgentProvider {
   localSource?: 'claude' | 'codex'
   /** Default model id for this provider. */
   model: string
+  /** Alias models known to a local gateway but not returned by its model list. Not persisted. */
+  extraModels?: string[]
 }
 
 /** Model per mode; missing means the provider's default model. */
@@ -58,6 +60,8 @@ export interface AgentStartRequest {
   sessionId?: string
   /** Model override for this run. */
   model?: string
+  /** Provider override for this run; omitted uses the active provider. */
+  providerId?: string
 }
 
 /** Build map: the repositories, knowledge and output folder a conversation works from. Saved with it. */

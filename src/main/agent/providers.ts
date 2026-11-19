@@ -54,33 +54,64 @@ export interface LocalGateway {
   baseUrl: string
   token: string
   model: string
+  /** Claude alias models that the gateway accepts even when /v1/models omits them. */
+  extraModels?: string[]
 }
 
+export const LOCAL_GATEWAY_ID = 'local-gateway'
+export const LOCAL_CLAUDE_ID = 'local-gateway'
+export const LOCAL_CODEX_ID = 'local-codex'
+
+export async function localGateways(home = homedir()): Promise<{ claude: LocalGateway | null; codex: LocalGateway | null }> {
+  return { claude: await readClaudeGateway(home), codex: await readCodexGateway(home) }
+}
+
+/** Prefers Claude, then Codex. Kept for callers that still want one gateway. */
 export async function localGateway(home = homedir()): Promise<LocalGateway | null> {
+  const gateways = await localGateways(home)
+  return gateways.claude ?? gateways.codex
+}
+
+async function readClaudeGateway(home: string): Promise<LocalGateway | null> {
   try {
     const settings = JSON.parse(await readFile(path.join(home, '.claude', 'settings.json'), 'utf8'))
     const env = settings?.env ?? {}
     if (typeof env.ANTHROPIC_AUTH_TOKEN === 'string' && typeof env.ANTHROPIC_BASE_URL === 'string' && env.ANTHROPIC_BASE_URL) {
-      const model = String(env.ANTHROPIC_MODEL ?? env.ANTHROPIC_DEFAULT_SONNET_MODEL ?? '')
-      return { kind: 'anthropic', source: 'claude', baseUrl: env.ANTHROPIC_BASE_URL, token: env.ANTHROPIC_AUTH_TOKEN, model }
+      const extraModels = uniqueStrings([
+        env.ANTHROPIC_MODEL,
+        env.ANTHROPIC_DEFAULT_SONNET_MODEL,
+        env.ANTHROPIC_DEFAULT_OPUS_MODEL,
+        env.ANTHROPIC_DEFAULT_HAIKU_MODEL
+      ])
+      return {
+        kind: 'anthropic',
+        source: 'claude',
+        baseUrl: env.ANTHROPIC_BASE_URL,
+        token: env.ANTHROPIC_AUTH_TOKEN,
+        model: extraModels[0] ?? '',
+        ...(extraModels.length ? { extraModels } : {})
+      }
     }
   } catch {
-    // fall through to the Codex config
+    // Claude Code is not configured
   }
+  return null
+}
+
+async function readCodexGateway(home: string): Promise<LocalGateway | null> {
   try {
     const toml = await readFile(path.join(home, '.codex', 'config.toml'), 'utf8')
-    const active = /^model_provider\s*=\s*"([^"]+)"/m.exec(toml)?.[1]
-    if (!active) return null
-    const header = '[model_providers.' + active + ']'
-    const at = toml.indexOf(header)
-    if (at < 0) return null
-    const rest = toml.slice(at + header.length)
-    const block = rest.slice(0, rest.search(/\n\[|$/))
-    const baseUrl = /base_url\s*=\s*"([^"]+)"/.exec(block)?.[1]
-    const token = codexToken(block)
-    if (!baseUrl || !token) return null
-    const wireApi = /wire_api\s*=\s*"([^"]+)"/.exec(block)?.[1]
-    const model = /^model\s*=\s*"([^"]+)"/m.exec(toml)?.[1] ?? ''
+    const preamble = toml.split(/\n\[/)[0] ?? ''
+    const model = quotedValue(preamble, 'model') ?? ''
+    const named = quotedValue(preamble, 'model_provider')
+    const blocks = codexProviderBlocks(toml)
+    const chosen = chooseCodexBlock(blocks, named)
+    const blockUrl = chosen ? quotedValue(chosen.body, 'base_url') : undefined
+    const baseUrl = blockUrl || normalizeCodexBase(quotedValue(preamble, 'openai_base_url'))
+    if (!baseUrl) return null
+    const token = (chosen ? codexToken(chosen.body) : '') || (await codexAuthToken(home)) || loopbackToken(baseUrl)
+    if (!token) return null
+    const wireApi = chosen ? quotedValue(chosen.body, 'wire_api') : undefined
     return { kind: wireApi === 'anthropic' ? 'anthropic' : 'openai', source: 'codex', baseUrl, token, model }
   } catch {
     // not installed
@@ -88,17 +119,96 @@ export async function localGateway(home = homedir()): Promise<LocalGateway | nul
   return null
 }
 
+function uniqueStrings(values: unknown[]): string[] {
+  const seen = new Set<string>()
+  for (const value of values) {
+    if (typeof value !== 'string') continue
+    const trimmed = value.trim()
+    if (trimmed) seen.add(trimmed)
+  }
+  return [...seen]
+}
+
+function quotedValue(text: string, key: string): string | undefined {
+  const match = new RegExp('(?:^|\\n)\\s*' + key + '\\s*=\\s*"([^"]*)"').exec(text)
+  const value = match?.[1]?.trim()
+  return value || undefined
+}
+
+interface CodexBlock {
+  id: string
+  body: string
+}
+
+function codexProviderBlocks(toml: string): CodexBlock[] {
+  const blocks: CodexBlock[] = []
+  const source = toml.startsWith('[') ? '\n' + toml : toml
+  const pattern = /(^|\n)\[model_providers\.([^\].]+)\][^\n]*/g
+  let match: RegExpExecArray | null
+  while ((match = pattern.exec(source))) {
+    const start = match.index + match[0].length
+    const rest = source.slice(start)
+    const next = rest.search(/\n\[/)
+    blocks.push({ id: match[2], body: next < 0 ? rest : rest.slice(0, next) })
+  }
+  return blocks
+}
+
+function chooseCodexBlock(blocks: CodexBlock[], named: string | undefined): CodexBlock | undefined {
+  if (named) {
+    const exact = blocks.find((block) => block.id === named)
+    if (exact) return exact
+  }
+  for (const id of ['magpie', 'custom', 'tencent_codebuddy']) {
+    const found = blocks.find((block) => block.id === id && quotedValue(block.body, 'base_url'))
+    if (found) return found
+  }
+  return blocks.find((block) => quotedValue(block.body, 'base_url'))
+}
+
+function normalizeCodexBase(raw: string | undefined): string | undefined {
+  if (!raw) return undefined
+  const trimmed = raw.replace(/\/+$/, '')
+  if (/\/backend-api\/codex$/.test(trimmed)) {
+    try {
+      return new URL(trimmed).origin + '/v1'
+    } catch {
+      return trimmed.replace(/\/backend-api\/codex$/, '/v1')
+    }
+  }
+  return trimmed
+}
+
 function codexToken(block: string): string {
-  const bearer = /experimental_bearer_token\s*=\s*"([^"]*)"/.exec(block)?.[1]
+  const bearer = quotedValue(block, 'experimental_bearer_token')
   if (bearer) return bearer
   const envKey = /env_key\s*=\s*"([^"]+)"/.exec(block)?.[1]
   return envKey ? (process.env[envKey] ?? '') : ''
 }
 
-export const LOCAL_GATEWAY_ID = 'local-gateway'
+async function codexAuthToken(home: string): Promise<string> {
+  try {
+    const auth = JSON.parse(await readFile(path.join(home, '.codex', 'auth.json'), 'utf8')) as { OPENAI_API_KEY?: unknown }
+    return typeof auth.OPENAI_API_KEY === 'string' ? auth.OPENAI_API_KEY.trim() : ''
+  } catch {
+    return ''
+  }
+}
+
+function loopbackToken(baseUrl: string): string {
+  try {
+    const host = new URL(baseUrl).hostname
+    return host === '127.0.0.1' || host === 'localhost' || host === '::1' ? 'local-gateway' : ''
+  } catch {
+    return /^https?:\/\/(?:127\.0\.0\.1|localhost)(?::|\/|$)/.test(baseUrl) ? 'local-gateway' : ''
+  }
+}
 
 export function defaultProviders(): AgentProvider[] {
-  return [{ id: LOCAL_GATEWAY_ID, name: 'Local gateway', kind: 'anthropic', baseUrl: '', keySource: 'local', model: '' }]
+  return [
+    { id: LOCAL_CLAUDE_ID, name: 'Claude Code Gateway', kind: 'anthropic', baseUrl: '', keySource: 'local', localSource: 'claude', model: '' },
+    { id: LOCAL_CODEX_ID, name: 'Codex / Magpie Gateway', kind: 'openai', baseUrl: '', keySource: 'local', localSource: 'codex', model: '' }
+  ]
 }
 
 // ---------- Requests ----------
@@ -129,7 +239,7 @@ async function post(url: string, headers: Record<string, string>, body: unknown,
   })
   if (!response.ok) throw new ModelHttpError(response.status, await response.text())
   const type = response.headers.get('content-type') ?? ''
-  if (onEvent && type.includes('text/event-stream')) return { json: await readSSE(response, onEvent), streamed: true }
+  if (type.includes('text/event-stream')) return { json: await readSSE(response, onEvent ?? (() => undefined)), streamed: true }
   const text = await response.text()
   try {
     return { json: JSON.parse(text), streamed: false }
@@ -214,7 +324,7 @@ async function callAnthropic(p: AgentProvider, key: string, req: ModelRequest): 
     if (data?.type === 'content_block_start' && data.content_block?.type === 'tool_use') {
       tools.set(data.index ?? tools.size, { id: data.content_block.id ?? '', name: data.content_block.name ?? '', json: '' })
     } else if (data?.type === 'content_block_delta') {
-      if (data.delta?.type === 'text_delta' && data.delta.text) req.onTextDelta?.(data.delta.text)
+      if (data.delta?.type === 'text_delta' && data.delta.text && req.onTextDelta) req.onTextDelta(data.delta.text)
       if (data.delta?.type === 'input_json_delta' && data.delta.partial_json) {
         const tool = tools.get(data.index ?? 0)
         if (tool) tool.json += data.delta.partial_json
@@ -238,7 +348,13 @@ async function callAnthropic(p: AgentProvider, key: string, req: ModelRequest): 
       tools: req.tools.map((t) => ({ name: t.name, description: t.description, input_schema: t.schema }))
     },
     req.signal,
-    streaming ? (_event, payload) => { try { take(JSON.parse(payload)) } catch { /* ignore a partial frame */ } } : undefined
+    (_event, payload) => {
+      try {
+        take(JSON.parse(payload))
+      } catch {
+        // ignore a partial frame
+      }
+    }
   )
   if (!streamed) {
     for (const c of json.content ?? []) {
@@ -298,7 +414,7 @@ async function callOpenAI(p: AgentProvider, key: string, req: ModelRequest): Pro
     const delta = choice.delta ?? {}
     if (typeof delta.content === 'string' && delta.content) {
       text += delta.content
-      req.onTextDelta?.(delta.content)
+      if (req.onTextDelta) req.onTextDelta(delta.content)
     }
     for (const call of delta.tool_calls ?? []) {
       const index = call.index ?? calls.size
@@ -322,7 +438,14 @@ async function callOpenAI(p: AgentProvider, key: string, req: ModelRequest): Pro
       tools: req.tools.map((t) => ({ type: 'function', function: { name: t.name, description: t.description, parameters: t.schema } }))
     },
     req.signal,
-    streaming ? (_event, payload) => { if (payload !== '[DONE]') { try { take(JSON.parse(payload)) } catch { /* ignore a partial frame */ } } } : undefined
+    (_event, payload) => {
+      if (payload === '[DONE]') return
+      try {
+        take(JSON.parse(payload))
+      } catch {
+        // ignore a partial frame
+      }
+    }
   )
   const blocks: Block[] = []
   if (!streamed) {
@@ -398,7 +521,8 @@ async function withRetry<T>(fn: () => Promise<T>, signal?: AbortSignal): Promise
 }
 
 export async function callModel(p: AgentProvider, key: string, req: ModelRequest): Promise<ModelReply> {
-  const call = (r: ModelRequest) => withRetry(() => (p.kind === 'anthropic' ? callAnthropic(p, key, r) : callOpenAI(p, key, r)), r.signal)
+  const route = codexRoute(p, req.model)
+  const call = (r: ModelRequest) => withRetry(() => (route.kind === 'anthropic' ? callAnthropic(route, key, r) : callOpenAI(route, key, r)), r.signal)
   if (req.maxTokens) return call(req)
   const id = `${p.id}/${req.model}`
   const known = outputBudget.get(id)
@@ -414,6 +538,14 @@ export async function callModel(p: AgentProvider, key: string, req: ModelRequest
   }
 }
 
+/** TT Switch serves ttsw-codex-* models on /codex/v1, not on its Anthropic /v1/messages route. */
+export function codexRoute(p: AgentProvider, model: string): AgentProvider {
+  if (p.kind !== 'anthropic' || !model.startsWith('ttsw-codex-')) return p
+  const base = trimBase(p.baseUrl).replace(/\/v1$/, '')
+  if (base.endsWith('/codex/v1')) return { ...p, kind: 'openai' }
+  return { ...p, kind: 'openai', baseUrl: `${base}/codex/v1` }
+}
+
 /** Model ids the provider lists (GET {base}/v1/models or {base}/models). */
 export async function listModels(p: AgentProvider, key: string): Promise<string[]> {
   const base = trimBase(p.baseUrl)
@@ -424,5 +556,6 @@ export async function listModels(p: AgentProvider, key: string): Promise<string[
   })
   if (!response.ok) throw new Error(`Cannot list models (${response.status})`)
   const data = (await response.json()) as { data?: unknown[]; models?: unknown[] }
-  return ((data.data ?? data.models ?? []) as Array<{ id?: string; name?: string }>).map((m) => m.id ?? m.name ?? '').filter(Boolean)
+  const fetched = ((data.data ?? data.models ?? []) as Array<{ id?: string; name?: string }>).map((m) => m.id ?? m.name ?? '').filter(Boolean)
+  return uniqueStrings([...(p.extraModels ?? []), ...fetched])
 }

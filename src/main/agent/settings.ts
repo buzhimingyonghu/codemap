@@ -2,7 +2,7 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import type { AgentProvider, AgentSettings, ProviderKind } from '../../shared/agent'
 import { electronSafeStorage, ensureElectronHost, getAgentHost, userDataDir } from './hostAdapter'
-import { LOCAL_GATEWAY_ID, callModel, defaultProviders, listModels, localGateway } from './providers'
+import { LOCAL_CLAUDE_ID, LOCAL_CODEX_ID, callModel, codexRoute, defaultProviders, listModels, localGateways, type LocalGateway } from './providers'
 
 // Agent settings live next to the app state; API keys are encrypted with the macOS keychain
 // (safeStorage) and only decrypted when a request is made. A host adapter can supply its own
@@ -13,9 +13,14 @@ interface Stored extends AgentSettings {
   keys: Record<string, string>
 }
 
-const DEFAULTS: Stored = { providers: defaultProviders(), activeProvider: LOCAL_GATEWAY_ID, modeModels: {}, maxParallel: 3, keys: {} }
+const DEFAULTS: Stored = { providers: defaultProviders(), activeProvider: LOCAL_CLAUDE_ID, modeModels: {}, maxParallel: 3, keys: {} }
 
 let cached: Stored | null = null
+
+/** Test hook: settings are cached for the process, so a new user-data dir needs a fresh read. */
+export function resetAgentSettingsCache(): void {
+  cached = null
+}
 
 function file(): string {
   return path.join(userDataDir(), 'agent.json')
@@ -26,13 +31,12 @@ async function load(): Promise<Stored> {
   await ensureElectronHost()
   try {
     const parsed = JSON.parse(await readFile(file(), 'utf8')) as Partial<Stored>
-    // Older files named the local gateway differently: map it onto the current one.
-    const legacy = (p: { id: string; keySource: string }) => p.keySource !== 'stored'
+    // Older files named the local gateway differently: map an unnamed local gateway onto Claude.
+    const legacy = (p: { id: string; keySource: string }) => p.keySource !== 'stored' && p.id !== LOCAL_CLAUDE_ID && p.id !== LOCAL_CODEX_ID
     const saved = Array.isArray(parsed.providers) && parsed.providers.length ? parsed.providers : DEFAULTS.providers
-    const providers = saved.map((p) => (legacy(p) ? { ...defaultProviders()[0], model: p.model ?? '' } : p))
-    // The local gateway is always offered, even if an older file removed it.
-    if (!providers.some((p) => p.id === LOCAL_GATEWAY_ID)) providers.unshift(defaultProviders()[0])
-    const activeProvider = saved.find((p) => p.id === parsed.activeProvider && legacy(p)) ? LOCAL_GATEWAY_ID : (parsed.activeProvider ?? LOCAL_GATEWAY_ID)
+    const providers = saved.map((p) => (legacy(p) ? { ...builtinLocal(LOCAL_CLAUDE_ID), model: p.model ?? '' } : p))
+    ensureBuiltinLocals(providers)
+    const activeProvider = saved.find((p) => p.id === parsed.activeProvider && legacy(p)) ? LOCAL_CLAUDE_ID : (parsed.activeProvider ?? LOCAL_CLAUDE_ID)
     // Older files carry maxTurns; runs have no turn limit any more, so it is dropped.
     const { maxTurns: _old, ...rest } = parsed as Partial<Stored> & { maxTurns?: number }
     cached = { ...DEFAULTS, ...rest, providers, activeProvider, modeModels: { ...(parsed.modeModels ?? {}) }, keys: { ...(parsed.keys ?? {}) } }
@@ -40,6 +44,33 @@ async function load(): Promise<Stored> {
     cached = structuredClone(DEFAULTS)
   }
   return cached
+}
+
+function builtinLocal(id: string): AgentProvider {
+  const found = defaultProviders().find((provider) => provider.id === id)
+  if (!found) throw new Error(`Missing built-in provider ${id}`)
+  return { ...found }
+}
+
+/** Keeps both built-in local gateways, inserting only the ones an older file does not have. */
+function ensureBuiltinLocals(providers: AgentProvider[]): void {
+  const builtins = defaultProviders()
+  const existing = new Map(providers.filter((provider) => builtins.some((builtin) => builtin.id === provider.id)).map((provider) => [provider.id, provider]))
+  const custom = providers.filter((provider) => !builtins.some((builtin) => builtin.id === provider.id))
+  providers.splice(0, providers.length, ...builtins.map((builtin) => existing.get(builtin.id) ?? { ...builtin }), ...custom)
+}
+
+function bindLocal(provider: AgentProvider, gateway: LocalGateway | null): AgentProvider {
+  if (!gateway) return { ...provider, hasKey: false, baseUrl: '', extraModels: undefined }
+  return {
+    ...provider,
+    hasKey: true,
+    baseUrl: gateway.baseUrl,
+    kind: gateway.kind,
+    localSource: gateway.source,
+    model: provider.model || gateway.model || '',
+    ...(gateway.extraModels?.length ? { extraModels: gateway.extraModels } : { extraModels: undefined })
+  }
 }
 
 /** Applies a host override for readers without writing it back into the cached file. */
@@ -66,21 +97,21 @@ function publicView(s: Stored): AgentSettings {
 }
 
 export async function getAgentSettings(): Promise<AgentSettings> {
-  const s = publicView(await withOverride(await load()))
+  const stored = await withOverride(await load())
+  const s = publicView(stored)
   // Tell the panel whether a local gateway is set up, and which wire protocol it speaks.
-  const local = s.providers.find((p) => p.keySource === 'local')
-  if (local) {
-    const gw = await localGateway()
-    local.hasKey = Boolean(gw)
-    local.baseUrl = gw?.baseUrl ?? ''
-    local.kind = gw?.kind ?? local.kind
-    local.localSource = gw?.source
-    if (!local.model && gw?.model) local.model = gw.model
-  }
+  const gws = await localGateways()
+  s.providers = s.providers.map((provider) => (provider.keySource === 'local' ? bindLocal(provider, gatewayFor(provider, gws)) : provider))
+  if (stored.activeProvider === LOCAL_CLAUDE_ID && !gws.claude && gws.codex) s.activeProvider = LOCAL_CODEX_ID
   for (const provider of s.providers) {
     if (provider.keySource === 'stored' && (await getAgentHost()?.hasSecret?.(provider.id))) provider.hasKey = true
   }
   return s
+}
+
+function gatewayFor(provider: AgentProvider, gws: { claude: LocalGateway | null; codex: LocalGateway | null }): LocalGateway | null {
+  if (provider.id === LOCAL_CODEX_ID || provider.localSource === 'codex') return gws.codex
+  return gws.claude
 }
 
 const SAFE_ID = /^[a-z0-9][a-z0-9-]{0,40}$/
@@ -93,13 +124,14 @@ export async function saveAgentSettings(next: AgentSettings): Promise<AgentSetti
     if (!SAFE_ID.test(String(p.id))) throw new Error(`Bad provider id: ${p.id}`)
     if (p.kind !== 'anthropic' && p.kind !== 'openai') throw new Error(`Unknown provider type: ${p.kind}`)
     if (p.keySource === 'local') {
-      providers.push({ ...defaultProviders()[0], model: String(p.model || '') })
+      const builtin = p.id === LOCAL_CODEX_ID || p.localSource === 'codex' ? builtinLocal(LOCAL_CODEX_ID) : builtinLocal(LOCAL_CLAUDE_ID)
+      providers.push({ ...builtin, model: String(p.model || '') })
       continue
     }
     if (!/^https?:\/\//.test(String(p.baseUrl))) throw new Error(`Base URL must start with http(s)://: ${p.baseUrl}`)
     providers.push({ id: p.id, name: String(p.name || p.id), kind: p.kind, baseUrl: String(p.baseUrl), keySource: 'stored', model: String(p.model || '') })
   }
-  if (!providers.some((p) => p.id === LOCAL_GATEWAY_ID)) providers.unshift(defaultProviders()[0])
+  ensureBuiltinLocals(providers)
   const keys = Object.fromEntries(Object.entries(current.keys).filter(([id]) => providers.some((p) => p.id === id)))
   await save({
     providers,
@@ -133,14 +165,27 @@ export async function setProviderKey(id: string, key: string | null): Promise<Ag
 /** The provider to use and its key (main process only). */
 export async function resolveProvider(id?: string | null): Promise<{ provider: AgentProvider; key: string }> {
   const s = await load()
-  let provider = s.providers.find((p) => p.id === (id ?? s.activeProvider)) ?? s.providers[0]
+  const gws = await localGateways()
+  let requested = id ?? s.activeProvider
+  if (!id && requested === LOCAL_CLAUDE_ID && !gws.claude && gws.codex) requested = LOCAL_CODEX_ID
+  let provider = s.providers.find((p) => p.id === requested) ?? s.providers[0]
   if (!provider) throw new Error('No model provider is configured')
   let key: string | null = null
   if (provider.keySource === 'local') {
-    const gw = await localGateway()
-    if (!gw) throw new Error('No local gateway detected (~/.claude/settings.json or ~/.codex/config.toml). Configure Claude Code / Codex or add a provider in AI Settings.')
+    const gw = gatewayFor(provider, gws)
+    if (!gw) {
+      const where = provider.id === LOCAL_CODEX_ID ? '~/.codex/config.toml' : '~/.claude/settings.json'
+      throw new Error(`No local gateway detected (${where}). Configure Claude Code / Codex or add a provider in AI Settings.`)
+    }
     key = gw.token
-    provider = { ...provider, kind: gw.kind, baseUrl: gw.baseUrl, model: provider.model || gw.model, localSource: gw.source }
+    provider = {
+      ...provider,
+      kind: gw.kind,
+      baseUrl: gw.baseUrl,
+      model: provider.model || gw.model,
+      localSource: gw.source,
+      ...(gw.extraModels?.length ? { extraModels: gw.extraModels } : {})
+    }
   } else {
     key = (await getAgentHost()?.getSecret?.(provider.id)) ?? null
     if (!key && s.keys[provider.id]) {
@@ -171,15 +216,19 @@ export async function testProviderConnection(providerId?: string | null, modelOv
   const { provider, key } = await resolveProvider(providerId)
   const model = modelOverride || provider.model
   if (!model) throw new Error(`No model chosen for ${provider.name}`)
+  const route = codexRoute(provider, model)
+  const rerouted = route.kind !== provider.kind || route.baseUrl !== provider.baseUrl
   const latency = () => Date.now() - started
-  try {
-    const models = await listModels(provider, key)
-    if (models.length) {
-      const known = models.includes(model)
-      return { ok: known, model, kind: provider.kind, latencyMs: latency(), message: known ? `Listed ${models.length} models` : `Connected, but ${model} is not in the model list` }
+  if (!rerouted) {
+    try {
+      const models = await listModels(provider, key)
+      if (models.length) {
+        if (models.includes(model)) return { ok: true, model, kind: route.kind, latencyMs: latency(), message: `Listed ${models.length} models` }
+        // Alias models can be accepted by the gateway without appearing in /v1/models.
+      }
+    } catch {
+      // Some gateways have no model list; a short completion is the fallback.
     }
-  } catch {
-    // Some gateways have no model list; a short completion is the fallback.
   }
   try {
     const reply = await callModel(provider, key, {
@@ -190,9 +239,9 @@ export async function testProviderConnection(providerId?: string | null, modelOv
       maxTokens: 16
     })
     const text = reply.blocks.find((block): block is Extract<typeof block, { type: 'text' }> => block.type === 'text')
-    return { ok: true, model, kind: provider.kind, latencyMs: latency(), message: text?.text.trim() ? 'Model replied' : 'Model accepted the request' }
+    return { ok: true, model, kind: route.kind, latencyMs: latency(), message: text?.text.trim() ? 'Model replied' : 'Model accepted the request' }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
-    return { ok: false, model, kind: provider.kind, latencyMs: latency(), message: message.split(key).join('[redacted]') }
+    return { ok: false, model, kind: route.kind, latencyMs: latency(), message: message.split(key).join('[redacted]') }
   }
 }

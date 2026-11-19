@@ -11,8 +11,6 @@ const settings = await import('../../src/main/agent/settings')
 const host = await import('../../src/main/agent/hostAdapter')
 const runtime = await import('../../src/main/agent/runtime')
 
-const home = mkdtempSync(path.join(tmpdir(), 'codemap-home-'))
-
 function sse(chunks: string[]): Response {
   const stream = Readable.toWeb(Readable.from(chunks.map((chunk) => Buffer.from(chunk)))) as ReadableStream<Uint8Array>
   return new Response(stream, { headers: { 'content-type': 'text/event-stream' } })
@@ -34,10 +32,13 @@ const provider = {
 afterEach(() => {
   vi.unstubAllGlobals()
   host.configureAgentHost(null)
+  delete process.env.CODEX_TEST_TOKEN
+  settings.resetAgentSettingsCache()
 })
 
 describe('local gateways', () => {
   it('reads a Codex provider as OpenAI unless wire_api says anthropic', async () => {
+    const home = mkdtempSync(path.join(tmpdir(), 'codemap-home-'))
     const dir = path.join(home, '.codex')
     mkdirSync(dir, { recursive: true })
     writeFileSync(
@@ -55,6 +56,52 @@ describe('local gateways', () => {
     process.env.CODEX_TEST_TOKEN = 'codex-secret'
     const gateway = await providers.localGateway(home)
     expect(gateway).toMatchObject({ kind: 'openai', source: 'codex', baseUrl: 'http://codex.example/v1', token: 'codex-secret', model: 'codex-model' })
+  })
+
+  it('detects Claude aliases and a Magpie Codex gateway independently', async () => {
+    const home = mkdtempSync(path.join(tmpdir(), 'codemap-both-'))
+    mkdirSync(path.join(home, '.claude'), { recursive: true })
+    mkdirSync(path.join(home, '.codex'), { recursive: true })
+    writeFileSync(
+      path.join(home, '.claude', 'settings.json'),
+      JSON.stringify({
+        env: {
+          ANTHROPIC_BASE_URL: 'http://127.0.0.1:15721',
+          ANTHROPIC_AUTH_TOKEN: '{{SECRET_8x4v8v2j}}',
+          ANTHROPIC_MODEL: 'ttsw-cc-balanced[1M]',
+          ANTHROPIC_DEFAULT_SONNET_MODEL: 'ttsw-cc-main[1M]',
+          ANTHROPIC_DEFAULT_OPUS_MODEL: 'ttsw-cc-balanced[1M]',
+          ANTHROPIC_DEFAULT_HAIKU_MODEL: 'claude-sonnet-5.5[1m]'
+        }
+      })
+    )
+    writeFileSync(
+      path.join(home, '.codex', 'config.toml'),
+      [
+        'model = "magpie-model"',
+        'openai_base_url = "http://127.0.0.1:3425/backend-api/codex"',
+        '',
+        '[model_providers.custom.capabilities]',
+        'streaming = true'
+      ].join('\n')
+    )
+    const found = await providers.localGateways(home)
+    expect(found.claude).toMatchObject({
+      kind: 'anthropic',
+      source: 'claude',
+      baseUrl: 'http://127.0.0.1:15721',
+      token: '{{SECRET_8x4v8v2j}}',
+      model: 'ttsw-cc-balanced[1M]',
+      extraModels: ['ttsw-cc-balanced[1M]', 'ttsw-cc-main[1M]', 'claude-sonnet-5.5[1m]']
+    })
+    expect(found.codex).toMatchObject({
+      kind: 'openai',
+      source: 'codex',
+      baseUrl: 'http://127.0.0.1:3425/v1',
+      token: 'local-gateway',
+      model: 'magpie-model'
+    })
+    expect(await providers.localGateway(home)).toMatchObject({ source: 'claude' })
   })
 })
 
@@ -122,6 +169,49 @@ describe('model streaming', () => {
     expect(plain.stop).toBe('end')
     expect(String((fetchMock.mock.calls[0][1] as RequestInit).body)).toContain('"stream":true')
   })
+
+  it('routes ttsw-codex models through the OpenAI Codex endpoint', async () => {
+    const fetchMock = vi.fn(async () => jsonResponse({ choices: [{ message: { content: 'routed' }, finish_reason: 'stop' }], usage: { prompt_tokens: 1, completion_tokens: 1 } }))
+    vi.stubGlobal('fetch', fetchMock)
+    const anthropic = { ...provider, kind: 'anthropic' as const, baseUrl: 'http://127.0.0.1:15721' }
+    const reply = await providers.callModel(anthropic, 'secret-key', {
+      model: 'ttsw-codex-deepseek-v4.1-flash',
+      system: 's',
+      messages: [],
+      tools: [],
+      maxTokens: 16
+    })
+    expect(reply.blocks).toEqual([{ type: 'text', text: 'routed' }])
+    const urls = fetchMock.mock.calls.map((call) => String(call.at(0)))
+    expect(urls[0]).toBe('http://127.0.0.1:15721/codex/v1/chat/completions')
+    const claude = await providers.callModel(anthropic, 'secret-key', {
+      model: 'ttsw-cc-balanced[1M]',
+      system: 's',
+      messages: [],
+      tools: [],
+      maxTokens: 16
+    })
+    expect(claude.stop).toBe('other')
+    urls.push(...fetchMock.mock.calls.slice(urls.length).map((call) => String(call.at(0))))
+    expect(urls[1]).toBe('http://127.0.0.1:15721/v1/messages')
+  })
+
+  it('reads an SSE body when no text callback was requested', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () =>
+        sse([
+          'data: {"choices":[{"delta":{"content":"OK"}}]}\n\n',
+          'data: {"choices":[{"finish_reason":"stop"}],"usage":{"prompt_tokens":2,"completion_tokens":1}}\n\n',
+          'data: [DONE]\n\n'
+        ])
+      )
+    )
+    const reply = await providers.callModel(provider, 'secret-key', { model: 'demo', system: 's', messages: [], tools: [], maxTokens: 16 })
+    expect(reply.blocks).toEqual([{ type: 'text', text: 'OK' }])
+    expect(reply.stop).toBe('end')
+    expect(reply.usage).toEqual({ input: 2, output: 1 })
+  })
 })
 
 describe('provider connection and history', () => {
@@ -166,5 +256,48 @@ describe('provider connection and history', () => {
     expect(history[0].content[0]).toMatchObject({ content: big })
     expect(compact[6]).toBe(history[6])
     expect((compact[3].content[0] as { text?: string }).text).toBe('short')
+  })
+
+  it('resolves the requested local gateway when both exist', async () => {
+    const home = mkdtempSync(path.join(tmpdir(), 'codemap-settings-home-'))
+    const userData = mkdtempSync(path.join(tmpdir(), 'codemap-settings-'))
+    mkdirSync(path.join(home, '.claude'), { recursive: true })
+    mkdirSync(path.join(home, '.codex'), { recursive: true })
+    writeFileSync(
+      path.join(home, '.claude', 'settings.json'),
+      JSON.stringify({ env: { ANTHROPIC_BASE_URL: 'http://127.0.0.1:15721', ANTHROPIC_AUTH_TOKEN: '{{SECRET_8x4v8v2j}}', ANTHROPIC_MODEL: 'claude-sonnet' } })
+    )
+    writeFileSync(path.join(home, '.codex', 'config.toml'), 'model = "codex-model"\nopenai_base_url = "http://127.0.0.1:3425/backend-api/codex/"\n')
+    writeFileSync(
+      path.join(userData, 'agent.json'),
+      JSON.stringify({
+        providers: [{ id: 'local-gateway', name: 'Old', kind: 'anthropic', baseUrl: '', keySource: 'local', model: 'ttsw-codex-deepseek-v4.1-flash' }],
+        activeProvider: 'local-gateway',
+        modeModels: { ask: 'mode-sonnet' },
+        maxParallel: 3,
+        keys: {}
+      })
+    )
+    const realHome = process.env.HOME
+    process.env.HOME = home
+    host.configureAgentHost({ userDataDir: () => userData, knowledgeDir: () => path.join(userData, 'knowledge') })
+    try {
+      const view = await settings.getAgentSettings()
+      expect(view.providers.map((item) => item.id)).toEqual(['local-gateway', 'local-codex'])
+      const claude = view.providers.find((item) => item.id === 'local-gateway')
+      const codex = view.providers.find((item) => item.id === 'local-codex')
+      expect(claude).toMatchObject({ hasKey: true, baseUrl: 'http://127.0.0.1:15721', localSource: 'claude', kind: 'anthropic', model: 'ttsw-codex-deepseek-v4.1-flash' })
+      expect(codex).toMatchObject({ hasKey: true, baseUrl: 'http://127.0.0.1:3425/v1', localSource: 'codex', kind: 'openai', model: 'codex-model' })
+      expect(view.activeProvider).toBe('local-gateway')
+      const claudeResolved = await settings.resolveProvider('local-gateway')
+      const codexResolved = await settings.resolveProvider('local-codex')
+      expect(claudeResolved.provider).toMatchObject({ id: 'local-gateway', baseUrl: 'http://127.0.0.1:15721', kind: 'anthropic' })
+      expect(codexResolved.provider).toMatchObject({ id: 'local-codex', baseUrl: 'http://127.0.0.1:3425/v1', kind: 'openai' })
+      expect(claudeResolved.key).toBe('{{SECRET_8x4v8v2j}}')
+      expect(codexResolved.key).toBe('local-gateway')
+    } finally {
+      if (realHome === undefined) delete process.env.HOME
+      else process.env.HOME = realHome
+    }
   })
 })
