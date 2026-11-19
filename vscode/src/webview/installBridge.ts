@@ -182,6 +182,7 @@ export function installVscodeCodemapBridge(): void {
       deleteSession: (id) => request('agent:deleteSession', [id]),
       applyChangeSet: (sessionId, changeSetId) => request('agent:applyChangeSet', [sessionId, changeSetId]),
       rejectChangeSet: (sessionId, changeSetId) => request('agent:rejectChangeSet', [sessionId, changeSetId]),
+      discardChangeSet: (sessionId, changeSetId) => request('agent:discardChangeSet', [sessionId, changeSetId]),
       knowledgeDir: () => request('agent:knowledgeDir'),
       pickRepos: () => request('agent:pickRepos'),
       pickDocs: () => request('agent:pickDocs'),

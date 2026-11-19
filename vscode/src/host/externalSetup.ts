@@ -12,10 +12,12 @@ export interface ExternalMcpConfig {
 export interface ExternalSetupResult {
   cursorFile: string
   claudeFile: string
+  skillFile: string
   jsonSnippet: string
   tomlSnippet: string
   cursorChanged: boolean
   claudeChanged: boolean
+  skillChanged: boolean
 }
 
 interface McpServerConfig {
@@ -44,14 +46,22 @@ export function setupExternalAgents(config: ExternalMcpConfig): ExternalSetupRes
   const server = mcpServerConfig(config)
   const cursorFile = path.join(config.workspaceRoot, '.cursor', 'mcp.json')
   const claudeFile = path.join(config.workspaceRoot, '.mcp.json')
+  const skillFile = path.join(config.workspaceRoot, '.agents', 'skills', 'codemap', 'SKILL.md')
   return {
     cursorFile,
     claudeFile,
+    skillFile,
     jsonSnippet: jsonSnippet(config),
     tomlSnippet: tomlSnippet(config),
     cursorChanged: mergeJson(cursorFile, server),
-    claudeChanged: mergeJson(claudeFile, server)
+    claudeChanged: mergeJson(claudeFile, server),
+    skillChanged: writeIfChanged(skillFile, skillMarkdown())
   }
+}
+
+export function skillMarkdown(): string {
+  return `${SKILL_MARKDOWN.trim()}
+`
 }
 
 export function appendTomlSnippet(file: string, snippet: string): boolean {
@@ -68,6 +78,47 @@ export function appendTomlSnippet(file: string, snippet: string): boolean {
   return true
 }
 
+
+function writeIfChanged(file: string, content: string): boolean {
+  let current = ''
+  try {
+    current = readFileSync(file, 'utf8')
+  } catch {
+    current = ''
+  }
+  if (current === content) return false
+  mkdirSync(path.dirname(file), { recursive: true })
+  writeFileSync(file, content)
+  return true
+}
+
+const SKILL_MARKDOWN = `
+# CodeMap
+
+Use the \`codemap\` MCP server to read and propose a CodeMap. Do not write node YAML until a person applies the proposal.
+
+## Tools
+
+- \`scan_repo_entrypoints\`: scan a workspace or granted repo for routes, RPCs, MQ/watch consumers, cron/timers, DB/Redis calls, and the git remote. Pass \`path\` for a folder and \`targetFolder\` for the node folder used to calculate \`repo.local\`.
+- \`map_overview\`: list the live maps.
+- \`read_node\`: read one node by global id.
+- \`show_on_map\`: open a map, light nodes, select a flow, and show a note.
+- \`propose_change_set\`: propose reviewed files and changes. Pass \`extend\` to update a pending proposal in place. Pass \`replaceChanges: true\` to replace its changes; otherwise new changes are appended and files are merged by path.
+- \`discard_change_set\`: discard an unapplied proposal by \`id\` when a draft is wedged. This does not change library files.
+
+## Build choices
+
+Pick one tier and one perspective before building:
+
+- Tiers: \`fast\` (L0+L1 skeleton, no review pause), \`balanced\` (one blueprint check, then L0+L1), \`deep\` (stage-by-stage drill-down).
+- Perspectives: \`service\` (microservices, entrypoints, storage), \`business\` (product stages), \`troubleshoot\` (state, retries, timeouts, background jobs).
+
+Read \`codemap://knowledge/common/guide.md\` and follow \`create/SOP.md\` for the chosen tier and perspective.
+
+## Checker
+
+Proposals must stay valid \`codemap/v1\`: every node has a name and kind, ids are unique, a map with edges or flows has \`contains\`, edge ends belong to that map, and code locations include their repo. Fix reported errors with \`extend\`, or discard the draft and start a clean proposal.
+`
 function mergeJson(file: string, server: McpServerConfig): boolean {
   const current = readJson(file)
   const servers = isRecord(current.mcpServers) ? { ...current.mcpServers } : {}

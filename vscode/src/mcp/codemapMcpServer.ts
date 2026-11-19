@@ -4,12 +4,13 @@ import path from 'node:path'
 import { buildModel, checkLibrary, codeOf, fnOf, roleOf, type CodemapModel } from '../../../src/shared/codemap/codemap.mjs'
 import { isInside } from '../../../src/shared/paths'
 import { loadLibrary, type LoadedLibrary } from '../../../src/main/codemap/loadLibrary.mjs'
+import { scanRepoEntrypoints } from '../host/mcpBridge'
 
 const PROTOCOL = '2025-03-26'
 const SERVER_NAME = 'codemap'
 const SERVER_VERSION = '0.1.0'
 
-const OFFLINE_TOOLS = new Set(['map_overview', 'read_node', 'find_nodes', 'validate_library', 'read_knowledge', 'list_knowledge'])
+const OFFLINE_TOOLS = new Set(['map_overview', 'read_node', 'find_nodes', 'validate_library', 'read_knowledge', 'list_knowledge', 'scan_repo_entrypoints'])
 
 interface JsonRpc {
   jsonrpc?: '2.0'
@@ -53,18 +54,22 @@ const TOOLS: ToolDefinition[] = [
   { name: 'lsp_definitions', description: 'Go to definition through the VS Code language service.', inputSchema: { type: 'object', properties: { file: { type: 'string' }, line: { type: 'number' }, column: { type: 'number' } }, required: ['file', 'line'] } },
   { name: 'lsp_references', description: 'Find references through the VS Code language service.', inputSchema: { type: 'object', properties: { file: { type: 'string' }, line: { type: 'number' }, column: { type: 'number' } }, required: ['file', 'line'] } },
   { name: 'show_on_map', description: 'Switch the open CodeMap, light nodes, select a flow, and show a note.', inputSchema: { type: 'object', properties: { map: { type: 'string' }, nodes: { type: 'array', items: { type: 'string' } }, flow: { type: 'string' }, note: { type: 'string' } } } },
-  { name: 'propose_change_set', description: 'Propose a reviewed CodeMap change. Nothing is written until a person applies it.', inputSchema: { type: 'object', properties: { title: { type: 'string' }, summary: { type: 'string' }, files: { type: 'object' }, changes: { type: 'array' }, extend: { type: 'string' }, requirement: { type: 'object' } }, required: ['title', 'summary'] } }
+  { name: 'propose_change_set', description: 'Propose a reviewed CodeMap change. Nothing is written until a person applies it. Pass extend to update a pending proposal, and replaceChanges to replace its changes instead of appending them.', inputSchema: { type: 'object', properties: { title: { type: 'string' }, summary: { type: 'string' }, files: { type: 'object' }, changes: { type: 'array' }, extend: { type: 'string', description: 'Pending proposal id to update in place' }, replaceChanges: { type: 'boolean', description: 'When extending, replace changes instead of appending them' }, requirement: { type: 'object' } }, required: ['title', 'summary'] } },
+  { name: 'discard_change_set', description: 'Discard an unapplied external proposal. Library files are not changed.', inputSchema: { type: 'object', properties: { id: { type: 'string', description: 'Unapplied proposal id to discard' }, reason: { type: 'string', description: 'Reason for discarding this draft' } }, required: ['id'] } },
+  { name: 'scan_repo_entrypoints', description: 'Scan routes, RPCs, MQ/watch consumers, cron/timers, DB/Redis calls, and the git remote in about a second.', inputSchema: { type: 'object', properties: { path: { type: 'string', description: 'Folder inside workspace or granted repos (defaults to workspace root)' }, targetFolder: { type: 'string', description: 'Optional node folder inside library for relative repo.local calculation' } } } }
 ]
 
 const RESOURCES = [
   ['codemap://knowledge/create/SOP.md', 'create/SOP.md', 'CodeMap build SOP'],
   ['codemap://knowledge/create/node-template.yaml', 'create/node-template.yaml', 'Node template'],
   ['codemap://knowledge/create/link-template.yaml', 'create/link-template.yaml', 'Link template'],
-  ['codemap://knowledge/create/requirement-template.yaml', 'create/requirement-template.yaml', 'Requirement template']
+  ['codemap://knowledge/create/requirement-template.yaml', 'create/requirement-template.yaml', 'Requirement template'],
+  ['codemap://knowledge/common/guide.md', 'common/guide.md', 'Shared CodeMap guide'],
+  ['codemap://knowledge/adjust/guide.md', 'adjust/guide.md', 'Adjust-mode CodeMap guide']
 ] as const
 
 const PROMPTS = [
-  { name: 'codemap-build', description: 'Build or extend a CodeMap from code.', arguments: [{ name: 'scope', description: 'Map or folder to build', required: false }] },
+  { name: 'codemap-build', description: 'Build or extend a CodeMap from code.', arguments: [{ name: 'scope', description: 'Map or folder to build', required: false }, { name: 'tier', description: 'fast, balanced, or deep. Defaults to balanced', required: false }, { name: 'lens', description: 'service, business, or troubleshoot. Defaults to service', required: false }] },
   { name: 'codemap-ask', description: 'Answer a question from the open CodeMap.', arguments: [{ name: 'question', description: 'Question to answer', required: true }] },
   { name: 'codemap-require', description: 'Turn a requirement into a reviewed CodeMap change.', arguments: [{ name: 'requirement', description: 'Requirement text', required: true }] }
 ]
@@ -135,6 +140,7 @@ export class CodemapMcpServer {
     const records = this.registryRecords()
     const bridge = await this.firstLive(records)
     if (bridge) return rpc(bridge, name, args)
+    if (name === 'scan_repo_entrypoints') return JSON.stringify(scanOfflineEntrypoints(this.options.workspace, args), null, 2)
     if (!OFFLINE_TOOLS.has(name)) throw new Error(`VS Code CodeMap is not running; ${name} needs the live bridge`)
     const view = this.offlineLibrary(records)
     switch (name) {
@@ -164,8 +170,10 @@ export class CodemapMcpServer {
   private prompt(name: string, args: Record<string, unknown>): { description: string; messages: Array<{ role: 'user'; content: { type: 'text'; text: string } }> } {
     const found = PROMPTS.find((prompt) => prompt.name === name)
     if (!found) throw new Error(`prompt not found: ${name}`)
+    const tier = buildTier(args.tier)
+    const lens = buildLens(args.lens)
     const text = {
-      'codemap-build': `Follow create/SOP.md. Build the map for ${str(args.scope) || 'the open workspace'}, then propose files with propose_change_set and fix checker errors with extend.`,
+      'codemap-build': buildPrompt(str(args.scope), tier, lens),
       'codemap-ask': `Answer from the CodeMap, cite node ids and path:line, and call show_on_map for the nodes you mean. Question: ${str(args.question)}`,
       'codemap-require': `Turn this requirement into one reviewed proposal with requirement metadata and proposed code: ${str(args.requirement)}`
     }[name]
@@ -346,6 +354,49 @@ function isLibrary(dir: string): boolean {
   } catch {
     return false
   }
+}
+
+
+function scanOfflineEntrypoints(workspace: string, args: Record<string, unknown>) {
+  const root = path.resolve(workspace)
+  return scanRepoEntrypoints({
+    workspaceRoot: root,
+    library: null,
+    access: { allowed: (target) => target === root || isInside(root, target) }
+  }, args)
+}
+
+function buildTier(value: unknown): 'fast' | 'balanced' | 'deep' {
+  const tier = str(value)
+  return tier === 'fast' || tier === 'deep' ? tier : 'balanced'
+}
+
+function buildLens(value: unknown): 'service' | 'business' | 'troubleshoot' {
+  const lens = str(value)
+  return lens === 'business' || lens === 'troubleshoot' ? lens : 'service'
+}
+
+function buildPrompt(scope: string, tier: 'fast' | 'balanced' | 'deep', lens: 'service' | 'business' | 'troubleshoot'): string {
+  const target = scope || 'the open workspace'
+  const tierGuide = {
+    fast: 'fast: produce the L0 and L1 skeleton with zero review pauses.',
+    balanced: 'balanced: align one structured blueprint, then build L0 and L1.',
+    deep: 'deep: review stage by stage and drill down to functions and branches.'
+  }[tier]
+  const lensGuide = {
+    service: 'service: group by real microservices, entrypoints, and DB/Redis/MQ.',
+    business: 'business: group by user-facing product capabilities and stages.',
+    troubleshoot: 'troubleshoot: highlight state transitions, retries, timeouts, and background jobs.'
+  }[lens]
+  return [
+    `Build the CodeMap for ${target}.`,
+    `Use tier ${tier} (${tierGuide}) and lens ${lens} (${lensGuide}).`,
+    'Call scan_repo_entrypoints first so routes, RPCs, MQ/watch consumers, cron/timers, DB/Redis, and the git remote are known.',
+    'Read codemap://knowledge/common/guide.md and follow create/SOP.md for this tier and lens.',
+    'Propose files with propose_change_set. Use extend to update a pending proposal, and replaceChanges when the previous changes should be replaced instead of appended.',
+    'If a draft gets wedged, call discard_change_set instead of leaving a broken proposal.',
+    'Keep every proposal inside the codemap/v1 checker rules: node name and kind, unique ids, map contains, edge ends, and repo next to code.'
+  ].join(' ')
 }
 
 function overview(model: CodemapModel): string {

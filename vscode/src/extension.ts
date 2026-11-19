@@ -7,14 +7,14 @@ import type { AgentSettings, AgentStartRequest } from '../../src/shared/agent'
 import type { CodemapLayoutPatch, CodemapLoad, CodemapNodePatch, ConfirmOptions, MenuItemSpec, WorkspaceSettings } from '../../src/shared/types'
 import { CodemapWatcher, grantable, resolveFolder } from '../../src/main/codemap/service'
 import { configureAgentHost, knowledgeDir as knowledgeRoot } from '../../src/main/agent/hostAdapter'
-import { applyChangeSet, deleteSession, getSession, injectExternalProposal, listSessions, rejectChangeSet, startRun, stopRun } from '../../src/main/agent/runtime'
+import { applyChangeSet, deleteSession, discardChangeSet, discardExternalProposal, getSession, injectExternalProposal, listSessions, rejectChangeSet, startRun, stopRun } from '../../src/main/agent/runtime'
 import { getAgentSettings, resolveProvider, saveAgentSettings, setProviderKey, testProviderConnection } from '../../src/main/agent/settings'
 import { listModels } from '../../src/main/agent/providers'
 import { CodeMapBridge } from './host/bridge'
 import { toVsDiagnostic, type YamlDiagnostic } from './host/diagnostics'
 import { createVsCodeLspAdapter, VsCodeLspBridge } from './host/lsp'
 import { createAgentLspTools } from './host/agentLsp'
-import { LoopbackMcpBridge } from './host/mcpBridge'
+import { LoopbackMcpBridge, type ExternalProposal } from './host/mcpBridge'
 import { resolveAgentKnowledgeDir } from './host/knowledge'
 import { appendTomlSnippet, jsonSnippet, setupExternalAgents, tomlSnippet, type ExternalMcpConfig } from './host/externalSetup'
 import { ProjectMapHost } from './host/projectMap'
@@ -534,6 +534,7 @@ function handlers(context: vscode.ExtensionContext, surface: WebviewSurface): Re
       return written
     },
     'agent:rejectChangeSet': ([sessionId, changeSetId]) => rejectChangeSet(requireLibrary(), String(sessionId), String(changeSetId)),
+    'agent:discardChangeSet': ([sessionId, changeSetId]) => discardChangeSet(requireLibrary(), String(sessionId), String(changeSetId), (event) => post({ type: 'event', channel: 'agent:event', payload: event })),
     'agent:knowledgeDir': () => knowledgeRoot(),
     'agent:pickRepos': () => pickGrantedFolders(context),
     'agent:pickDocs': () => pickGrantedDocs(context),
@@ -1017,7 +1018,11 @@ async function setupMcpCommand(context: vscode.ExtensionContext): Promise<void> 
   }
   const result = setupExternalAgents(config)
   const written =
-    picked.id === 'cursor' ? [result.cursorChanged ? result.cursorFile : ''] : picked.id === 'claude' ? [result.claudeChanged ? result.claudeFile : ''] : [result.cursorFile, result.claudeFile].filter(Boolean)
+    picked.id === 'cursor'
+      ? [result.cursorChanged ? result.cursorFile : '', result.skillChanged ? result.skillFile : '']
+      : picked.id === 'claude'
+        ? [result.claudeChanged ? result.claudeFile : '', result.skillChanged ? result.skillFile : '']
+        : [result.cursorFile, result.claudeFile, result.skillChanged ? result.skillFile : ''].filter(Boolean)
   const files = written.filter(Boolean)
   void vscode.window.showInformationMessage(
     files.length
@@ -1068,7 +1073,8 @@ async function syncMcpBridge(context: vscode.ExtensionContext): Promise<void> {
       agentLsp: agentLsp(),
       callbacks: {
         onShowOnMap: (request) => showExternalOnMap(context, request),
-        onExternalProposal: (proposal) => acceptExternalProposal(context, proposal)
+        onExternalProposal: (proposal) => acceptExternalProposal(context, proposal),
+        onDiscardProposal: (id, reason) => handleExternalDiscard(context, id, reason)
       }
     })
     registerNativeMcp(context, registryDir)
@@ -1085,18 +1091,25 @@ async function showExternalOnMap(context: vscode.ExtensionContext, request: { ma
 
 async function acceptExternalProposal(
   context: vscode.ExtensionContext,
-  proposal: { title: string; summary: string; changes: Record<string, unknown>[]; files: Record<string, string>; requirement?: { id: string; name: string; desc?: string } }
+  proposal: ExternalProposal
 ) {
   const lib = bridge?.getLibrary() ?? (bridge?.getRoot() ? (await initAndRememberDefaultLibrary(context)).library : null)
   if (!lib) throw new Error('Open a workspace with a CodeMap library first')
   const saved = await injectExternalProposal(
     lib,
     { title: proposal.title, summary: proposal.summary, changes: proposal.changes, files: proposal.files, requirement: proposal.requirement },
-    (event) => post({ type: 'event', channel: 'agent:event', payload: event })
+    (event) => post({ type: 'event', channel: 'agent:event', payload: event }),
+    { extend: proposal.extend, replaceChanges: proposal.replaceChanges }
   )
   const target: WebviewSurface = sidebarView?.visible ? 'sidebar' : 'panel'
   if (target === 'panel') await openPanel(context)
   hub.send(target, { kind: 'externalProposal', sessionId: saved.sessionId, changeSetId: saved.changeSet.id })
+}
+
+async function handleExternalDiscard(context: vscode.ExtensionContext, id: string, _reason?: string): Promise<void> {
+  const lib = bridge?.getLibrary() ?? (bridge?.getRoot() ? (await initAndRememberDefaultLibrary(context)).library : null)
+  if (!lib) throw new Error('Open a workspace with a CodeMap library first')
+  await discardExternalProposal(lib, id, (event) => post({ type: 'event', channel: 'agent:event', payload: event }))
 }
 
 function registerNativeMcp(context: vscode.ExtensionContext, registryDir: string): void {

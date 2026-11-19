@@ -126,3 +126,13 @@ test('codemap-mcp.cjs answers initialize over stdio', async () => {
   expect(output).toContain('codemap')
   expect(output).toContain('2025-03-26')
 })
+
+test('webview and extension wire agent:discardChangeSet', async () => {
+  const extension = await readFile(path.resolve(__dirname, '../src/extension.ts'), 'utf8')
+  const bridge = await readFile(path.resolve(__dirname, '../src/webview/installBridge.ts'), 'utf8')
+  expect(extension).toContain("import { applyChangeSet, deleteSession, discardChangeSet, discardExternalProposal, getSession, injectExternalProposal, listSessions, rejectChangeSet, startRun, stopRun } from '../../src/main/agent/runtime'")
+  expect(extension).toContain("'agent:discardChangeSet': ([sessionId, changeSetId]) => discardChangeSet(requireLibrary(), String(sessionId), String(changeSetId), (event) => post({ type: 'event', channel: 'agent:event', payload: event }))")
+  expect(extension).toContain('onDiscardProposal: (id, reason) => handleExternalDiscard(context, id, reason)')
+  expect(extension).toContain('{ extend: proposal.extend, replaceChanges: proposal.replaceChanges }')
+  expect(bridge).toContain("discardChangeSet: (sessionId, changeSetId) => request('agent:discardChangeSet', [sessionId, changeSetId])")
+})

@@ -1,6 +1,6 @@
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto'
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
-import { mkdirSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync, type Dirent } from 'node:fs'
 import path from 'node:path'
 import yaml from 'js-yaml'
 import { buildModel, checkLibrary, codeOf, edgeData, fnOf, issueKey, resolveCode, roleOf, type CodemapModel, type Issue, type LibraryCheck } from '../../../src/shared/codemap/codemap.mjs'
@@ -32,11 +32,13 @@ export interface ExternalProposal {
   problems: Array<{ level: string; rule: string; where: string; msg: string }>
   status: 'proposed'
   extend?: string
+  replaceChanges?: boolean
 }
 
 export interface McpBridgeCallbacks {
   onShowOnMap(request: ShowOnMapRequest): void | Promise<void>
   onExternalProposal(proposal: ExternalProposal): void | Promise<void>
+  onDiscardProposal?(id: string, reason?: string): void | Promise<void>
 }
 
 export interface McpBridgeOptions {
@@ -71,6 +73,7 @@ export class LoopbackMcpBridge {
   private port = 0
   private context: BridgeContext
   private disposed = false
+  private readonly proposals = new Map<string, ExternalProposal>()
 
   private constructor(
     private readonly options: McpBridgeOptions,
@@ -202,6 +205,10 @@ export class LoopbackMcpBridge {
         return this.showOnMap(params)
       case 'propose_change_set':
         return this.propose(params)
+      case 'discard_change_set':
+        return this.discard(params)
+      case 'scan_repo_entrypoints':
+        return scanRepoEntrypoints(this.scanRoots(), params)
       default:
         throw new Error(`unknown method ${method}`)
     }
@@ -249,29 +256,55 @@ export class LoopbackMcpBridge {
     return { shown: true, map, nodes, flow }
   }
 
+  private scanRoots(): ScanRoots {
+    return { workspaceRoot: this.context.workspaceRoot, library: this.context.library, access: this.options.access }
+  }
+
   private async propose(params: Record<string, unknown>): Promise<Record<string, unknown>> {
     const view = this.libraryView()
     const files = sanitizeFiles(params.files)
     const changes = Array.isArray(params.changes) ? params.changes.filter((item): item is Record<string, unknown> => isRecord(item)) : []
-    const problems = checkProposal(view.loaded, files, changes)
+    const extend = params.extend ? str(params.extend) : ''
+    const previous = extend ? this.proposals.get(extend) : undefined
+    if (extend && !previous) throw new Error(`no pending proposal ${extend}`)
+    const mergedFiles = previous ? { ...previous.files, ...files } : files
+    const mergedChanges = previous ? (params.replaceChanges === true ? changes : [...previous.changes, ...changes]) : changes
+    const problems = checkProposal(view.loaded, mergedFiles, mergedChanges)
     const proposal: ExternalProposal = {
-      id: str(params.extend || params.id) || `ext-${randomBytes(4).toString('hex')}`,
-      title: str(params.title) || 'External proposal',
-      summary: str(params.summary),
-      changes,
-      files,
-      requirement: requirementOf(params.requirement),
+      id: extend || str(params.id) || `ext-${randomBytes(4).toString('hex')}`,
+      title: str(params.title) || previous?.title || 'External proposal',
+      summary: str(params.summary) || previous?.summary || '',
+      changes: mergedChanges,
+      files: mergedFiles,
+      requirement: requirementOf(params.requirement) ?? previous?.requirement,
       problems,
       status: 'proposed',
-      extend: params.extend ? str(params.extend) : undefined
+      extend: extend || undefined,
+      replaceChanges: params.replaceChanges === true
     }
+    this.proposals.set(proposal.id, proposal)
     await this.options.callbacks?.onExternalProposal?.(proposal)
     return {
       id: proposal.id,
+      extended: Boolean(extend),
+      replaceChanges: proposal.replaceChanges === true,
+      files: Object.keys(mergedFiles),
+      changeCount: mergedChanges.length,
       problems,
       fixes: problems.map(prescribe),
       summary: problems.length ? `${problems.filter((problem) => problem.level === 'error').length} errors` : 'no new problems'
     }
+  }
+
+  private async discard(params: Record<string, unknown>): Promise<{ discarded: true; id: string; title: string }> {
+    const id = str(params.id)
+    if (!id) throw new Error('id is required')
+    const proposal = this.proposals.get(id)
+    if (!proposal) throw new Error(`no pending proposal ${id}`)
+    this.proposals.delete(id)
+    const reason = params.reason ? str(params.reason) : undefined
+    await this.options.callbacks?.onDiscardProposal?.(id, reason)
+    return { discarded: true, id, title: proposal.title }
   }
 }
 
@@ -470,6 +503,164 @@ function requirementOf(value: unknown): ExternalProposal['requirement'] {
   const id = str(value.id)
   if (!id) return undefined
   return { id, name: str(value.name) || id, desc: value.desc ? str(value.desc) : undefined }
+}
+
+export interface ScanRoots {
+  workspaceRoot: string | null
+  library: string | null
+  access?: McpBridgeAccess
+}
+
+export interface RepoEntrypoint {
+  kind: 'route' | 'rpc' | 'mq' | 'cron' | 'db' | 'git'
+  file: string
+  line: number
+  text: string
+  repoLocal?: string
+}
+
+const SCAN_SKIP = new Set(['.git', 'node_modules', 'dist', 'out', 'build', 'vendor', 'target', '.codex', 'coverage'])
+const SOURCE_EXT = new Set(['.go', '.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs', '.py', '.java', '.kt', '.rs'])
+const MAX_SCAN_FILES = 4000
+const MAX_SCAN_HITS = 400
+
+const ENTRY_RULES: Array<{ kind: RepoEntrypoint['kind']; pattern: RegExp }> = [
+  { kind: 'route', pattern: /\.(?:GET|POST|PUT|PATCH|DELETE|Handle|HandleFunc|Route)\s*\(|\b(?:app|router|r)\.(?:get|post|put|patch|delete|use)\s*\(|@(?:Get|Post|Put|Patch|Delete|Request)Mapping\b|@(?:app|router)\.(?:get|post|put|patch|delete|route)\b|\b(?:gin|echo|chi|mux|http)\.(?:New|Handle|ListenAndServe)\b|\bListenAndServe\b|\bhttp\.Handle(?:Func)?\s*\(/ },
+  { kind: 'rpc', pattern: /\bRegister\w*Server\s*\(|\bRegister\w*Handler\s*\(|\bgrpc\.(?:NewServer|Dial)\b|\btrpc\.(?:NewServer|Register)\b|\bpb\.Register\w+\s*\(|@GrpcService\b/ },
+  { kind: 'mq', pattern: /\.(?:Watch|Consume|Subscribe|AddConsumer)\s*\(|\b(?:kafka|nsq|rocketmq|pulsar|amqp)\b[^\n]{0,80}\b(?:Consume|Subscribe|Watch|NewConsumer)\b|\bNew(?:Ticker|Timer)\b/ },
+  { kind: 'cron', pattern: /\bcron\.(?:New|AddFunc|Schedule)\b|@Scheduled\b|\bset(?:Interval|Timeout)\s*\(|\btime\.(?:Tick|NewTicker|AfterFunc)\b|\bNewTicker\s*\(/ },
+  { kind: 'db', pattern: /\b(?:redis|Redis|gorm|sql\.Open|mongo|etcd)\b[^\n]{0,40}\b(?:Get|Set|HGet|HSet|Query|Exec|Open|Watch|Dial)\s*\(|\b(?:db|redis|rdb)\.(?:Query|Exec|Get|Set|HGet|HSet)\s*\(/ }
+]
+
+export function scanRepoEntrypoints(roots: ScanRoots, params: Record<string, unknown>): { root: string; remote: string; repoLocal: string; entrypoints: RepoEntrypoint[] } {
+  const root = resolveScanRoot(roots, params.path ? str(params.path) : '')
+  const targetFolder = params.targetFolder ? str(params.targetFolder) : ''
+  const remote = gitRemote(root)
+  const repoLocal = relativeRepoLocal(roots.library, targetFolder, root)
+  const entrypoints: RepoEntrypoint[] = []
+  const files = listSourceFiles(root)
+  for (const file of files) {
+    if (entrypoints.length >= MAX_SCAN_HITS) break
+    let text = ''
+    try {
+      text = readFileSync(file, 'utf8')
+    } catch {
+      continue
+    }
+    if (text.includes('\0')) continue
+    const lines = text.split(/\n/)
+    for (let index = 0; index < lines.length && entrypoints.length < MAX_SCAN_HITS; index += 1) {
+      const line = lines[index]
+      if (!line.trim() || line.length > 400) continue
+      const rule = ENTRY_RULES.find((candidate) => candidate.pattern.test(line))
+      if (!rule) continue
+      entrypoints.push({
+        kind: rule.kind,
+        file: path.relative(root, file).split(path.sep).join('/'),
+        line: index + 1,
+        text: line.trim().slice(0, 180),
+        ...(repoLocal ? { repoLocal } : {})
+      })
+    }
+  }
+  if (remote) {
+    entrypoints.push({ kind: 'git', file: '.git/config', line: 1, text: remote, ...(repoLocal ? { repoLocal } : {}) })
+  }
+  entrypoints.sort((a, b) => a.kind.localeCompare(b.kind) || a.file.localeCompare(b.file) || a.line - b.line || a.text.localeCompare(b.text))
+  return { root, remote, repoLocal, entrypoints }
+}
+
+function resolveScanRoot(roots: ScanRoots, requested: string): string {
+  const base = roots.workspaceRoot
+  if (!base && !requested) throw new Error('no workspace root is open')
+  const root = path.resolve(requested || base || '')
+  if (!allowedScan(roots, root)) throw new Error(`not allowed to scan ${root}`)
+  if (!existsDir(root)) throw new Error(`scan path is not a folder: ${root}`)
+  return root
+}
+
+function allowedScan(roots: ScanRoots, target: string): boolean {
+  if (roots.access?.allowed(target)) return true
+  if (roots.workspaceRoot && (target === roots.workspaceRoot || isInside(roots.workspaceRoot, target))) return true
+  if (roots.library && (target === roots.library || isInside(roots.library, target))) return true
+  return false
+}
+
+function relativeRepoLocal(library: string | null, targetFolder: string, repoRoot: string): string {
+  if (!library) return ''
+  const base = targetFolder ? path.resolve(library, targetFolder) : library
+  if (!isInside(library, base) && base !== path.resolve(library)) return ''
+  let relative = path.relative(base, repoRoot)
+  if (!relative) relative = '.'
+  return relative.split(path.sep).join('/')
+}
+
+function gitRemote(root: string): string {
+  const file = path.join(root, '.git', 'config')
+  if (!existsFile(file)) return ''
+  if (!isInside(root, file)) return ''
+  let text = ''
+  try {
+    text = readFileSync(file, 'utf8')
+  } catch {
+    return ''
+  }
+  const lines = text.split(/\n/)
+  let inOrigin = false
+  for (const line of lines) {
+    const section = /^\s*\[remote\s+"([^"]+)"\]/.exec(line)
+    if (section) {
+      inOrigin = section[1] === 'origin'
+      continue
+    }
+    if (/^\s*\[/.test(line)) inOrigin = false
+    if (!inOrigin) continue
+    const url = /^\s*url\s*=\s*(\S+)/.exec(line)
+    if (url) return url[1]
+  }
+  const fallback = /^\s*url\s*=\s*(\S+)/m.exec(text)
+  return fallback?.[1] ?? ''
+}
+
+function listSourceFiles(root: string): string[] {
+  const files: string[] = []
+  const walk = (current: string) => {
+    if (files.length >= MAX_SCAN_FILES) return
+    let entries: Dirent[]
+    try {
+      entries = readdirSync(current, { withFileTypes: true })
+    } catch {
+      return
+    }
+    entries.sort((a, b) => a.name.localeCompare(b.name))
+    for (const entry of entries) {
+      if (files.length >= MAX_SCAN_FILES) return
+      if (entry.name.startsWith('.') && entry.name !== '.git') continue
+      if (SCAN_SKIP.has(entry.name)) continue
+      const full = path.join(current, entry.name)
+      if (!isInside(root, full)) continue
+      if (entry.isDirectory()) walk(full)
+      else if (SOURCE_EXT.has(path.extname(entry.name).toLowerCase())) files.push(full)
+    }
+  }
+  walk(root)
+  return files
+}
+
+function existsDir(file: string): boolean {
+  try {
+    return statSync(file).isDirectory()
+  } catch {
+    return false
+  }
+}
+
+function existsFile(file: string): boolean {
+  try {
+    return statSync(file).isFile()
+  } catch {
+    return false
+  }
 }
 
 function authorized(header: string | undefined, token: string): boolean {
