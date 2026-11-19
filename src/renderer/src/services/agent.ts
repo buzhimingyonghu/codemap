@@ -466,7 +466,7 @@ function onEvent(event: AgentEvent): void {
   if (event.sessionId !== state.sessionId) return
   switch (event.type) {
     case 'text':
-      patchLast((m) => ({ ...m, text: joinText(m.text, event.text) }))
+      patchLast((m) => ({ ...m, text: event.append ? m.text + event.text : joinText(m.text, event.text) }))
       break
     case 'tool':
       patchLast((m) => ({ ...m, steps: [...(m.steps ?? []), { name: event.name, label: event.label }] }))

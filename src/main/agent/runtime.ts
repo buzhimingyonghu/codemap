@@ -156,8 +156,10 @@ const CUT_OFF =
   'Your last reply was cut off by the output limit, so any tool call in it was lost. Continue from where you stopped. If you were proposing a change set, split it: propose one or two files per propose_change_set call.'
 
 interface LoopHooks {
-  /** Called with every text block (main run: shown in the chat). */
-  onText(text: string): void
+  /** Called with every text delta or block; `append` is true inside the same model turn. */
+  onText(text: string, append: boolean): void
+  /** Called once at the end of a model turn with its combined text, when non-empty. */
+  onTurnText?(text: string): void
   /** Wraps each tool call (main run: shown as steps). */
   onTool(name: string, label: string): (ok: boolean, summary: string) => void
   /** Messages to add before the next model turn (user messages typed while running). */
@@ -198,6 +200,7 @@ async function turnLoop(
       else history.push({ role: 'user', content: blocks })
     }
     let streamedInTurn = false
+    let turnText = ''
     const answer = await callModel(ctx.provider, ctx.key, {
       model: ctx.model,
       system: ctx.system,
@@ -206,8 +209,10 @@ async function turnLoop(
       signal: ctx.signal,
       onTextDelta: (delta) => {
         if (!delta) return
+        const append = streamedInTurn
         streamedInTurn = true
-        hooks.onText(delta)
+        turnText += delta
+        hooks.onText(delta, append)
       }
     })
     emitUsage(answer.usage.input, answer.usage.output)
@@ -216,7 +221,15 @@ async function turnLoop(
     const blocks = cut ? answer.blocks.filter((b) => b.type === 'text') : answer.blocks
     history.push({ role: 'assistant', content: blocks.length ? blocks : [{ type: 'text', text: '…' }] })
     // A live stream already delivered the text token by token. A JSON reply still arrives whole.
-    if (!streamedInTurn) for (const b of blocks) if (b.type === 'text') hooks.onText(b.text)
+    if (!streamedInTurn) {
+      for (const b of blocks) {
+        if (b.type !== 'text' || !b.text) continue
+        const append = Boolean(turnText)
+        turnText += (append ? '\n\n' : '') + b.text
+        hooks.onText(append ? '\n\n' + b.text : b.text, append)
+      }
+    }
+    if (turnText.trim()) hooks.onTurnText?.(turnText)
     const calls = blocks.filter((b) => b.type === 'tool_use') as Array<Extract<Block, { type: 'tool_use' }>>
     if (!calls.length) {
       const next = cut ? CUT_OFF : (hooks.pending?.().length ? null : hooks.nudge?.() ?? null)
@@ -266,9 +279,10 @@ async function runLoop(s: Session, access: CodemapAccess, req: AgentStartRequest
     const defs = toolsFor(s.mode, true, { lsp: Boolean(lsp) })
     const system = await systemPrompt(s.library, s.mode, withSources(s, req.context))
     reason = await turnLoop({ provider, key, model, system, signal: controller.signal }, s.history, defs, env, (input, output) => emit({ type: 'usage', sessionId: s.id, runId, input, output }), {
-      onText: (text) => {
-        reply.text += (reply.text ? '\n\n' : '') + text
-        emit({ type: 'text', sessionId: s.id, runId, text })
+      onText: (text, append) => {
+        const sep = reply.text && !append ? '\n\n' : ''
+        reply.text += sep + text
+        emit({ type: 'text', sessionId: s.id, runId, text: sep + text, append: true })
       },
       onTool: (name, label) => {
         const callId = randomUUID().slice(0, 8)
@@ -466,9 +480,11 @@ async function runSubAgent(
   let report = ''
   let nudges = 0
   const reason = await turnLoop({ provider, key, model, system, signal }, history, defs, env, (input, output) => emit({ type: 'usage', sessionId: s.id, runId, input, output }), {
-    onText: (text) => {
+    onText: () => undefined,
+    onTurnText: (text) => {
       report = text
-      emit({ type: 'worker-step', sessionId: s.id, runId, workerId, node, label: text.split('\n')[0].slice(0, 160), note: true })
+      const firstLine = text.trim().split('\n')[0]?.slice(0, 160)
+      if (firstLine) emit({ type: 'worker-step', sessionId: s.id, runId, workerId, node, label: firstLine, note: true })
     },
     onTool: (_name, label) => {
       emit({ type: 'worker-step', sessionId: s.id, runId, workerId, node, label })

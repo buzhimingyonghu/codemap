@@ -103,7 +103,7 @@ export interface AgentChangeSet {
 
 export type AgentEvent =
   | { type: 'session'; sessionId: string; mode: AgentMode; title: string }
-  | { type: 'text'; sessionId: string; runId: string; text: string }
+  | { type: 'text'; sessionId: string; runId: string; text: string; append?: boolean }
   | { type: 'tool'; sessionId: string; runId: string; callId: string; name: string; label: string }
   | { type: 'tool-result'; sessionId: string; runId: string; callId: string; ok: boolean; summary: string }
   /** The map follows the agent: open `map`, light up `nodes`, optionally select `flow`. */

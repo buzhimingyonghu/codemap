@@ -8,7 +8,7 @@ import { describe, expect, it, vi } from 'vitest'
 const userData = mkdtempSync(path.join(tmpdir(), 'codemap-loop-'))
 vi.mock('electron', () => ({ app: { getPath: () => userData, isPackaged: false, getAppPath: () => process.cwd() }, safeStorage: { isEncryptionAvailable: () => false } }))
 
-type Req = { system: string; messages: Array<{ role: string; content: any[] }> }
+type Req = { system: string; messages: Array<{ role: string; content: any[] }>; onTextDelta?: (delta: string) => void }
 type Reply = { blocks: any[]; stop: string }
 let script: (req: Req, n: number) => Promise<Reply> | Reply = () => ({ blocks: [], stop: 'end' })
 let calls = 0
@@ -250,5 +250,29 @@ describe('agent run loop', () => {
     expect(r.events.some((e) => e.type === 'phase')).toBe(true)
     const s = await getSession(lib.library, id)
     expect(s.messages[s.messages.length - 1].end).toBe('stopped')
+  })
+
+  it('concatenates streamed deltas within a turn and separates turns with a paragraph break', async () => {
+    calls = 0
+    script = (req, n) => {
+      if (n === 0) {
+        for (const ch of ['根', '图', '的', '连', '线和', '流程', '是', '空', '的', '，']) req.onTextDelta?.(ch)
+        return { blocks: [text('根图的连线和流程是空的，'), tool('map_overview', {})], stop: 'tool' }
+      }
+      for (const ch of ['我', '先', '补', 'L0']) req.onTextDelta?.(ch)
+      return { blocks: [text('我先补L0')], stop: 'end' }
+    }
+    const lib = library()
+    const r = run('ask', 'check root', lib)
+    const id = await r.id
+    expect(await r.done).toBe('end')
+    const textEvents = r.events.filter((e) => e.type === 'text')
+    let rendered = ''
+    for (const ev of textEvents) {
+      rendered = ev.append ? rendered + ev.text : rendered ? rendered + '\n\n' + ev.text : ev.text
+    }
+    expect(rendered).toBe('根图的连线和流程是空的，\n\n我先补L0')
+    const s = await getSession(lib.library, id)
+    expect(s.messages[s.messages.length - 1].text).toBe('根图的连线和流程是空的，\n\n我先补L0')
   })
 })

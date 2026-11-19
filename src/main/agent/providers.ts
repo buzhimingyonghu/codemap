@@ -528,12 +528,22 @@ export async function callModel(p: AgentProvider, key: string, req: ModelRequest
   const known = outputBudget.get(id)
   const tries = known ? OUTPUT_TOKENS.filter((n) => n <= known) : OUTPUT_TOKENS
   for (let i = 0; ; i++) {
+    let streamed = false
     try {
-      const reply = await call({ ...req, maxTokens: tries[i] })
+      const reply = await call({
+        ...req,
+        maxTokens: tries[i],
+        onTextDelta: req.onTextDelta
+          ? (delta) => {
+              streamed = true
+              req.onTextDelta!(delta)
+            }
+          : undefined
+      })
       outputBudget.set(id, tries[i])
       return reply
     } catch (error) {
-      if (i + 1 >= tries.length || !budgetError(error)) throw error
+      if (streamed || i + 1 >= tries.length || !budgetError(error)) throw error
     }
   }
 }
