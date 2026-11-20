@@ -312,7 +312,7 @@ function handlers(context: vscode.ExtensionContext, surface: WebviewSurface): Re
   const current = bridge!
   return {
     'app:info': () => ({
-      version: '0.1.0',
+      version: '1.0.0',
       platform: process.platform,
       arch: process.arch,
       userPluginsDir: '',

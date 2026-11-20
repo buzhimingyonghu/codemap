@@ -8,7 +8,7 @@ import { scanRepoEntrypoints } from '../host/mcpBridge'
 
 const PROTOCOL = '2025-03-26'
 const SERVER_NAME = 'codemap'
-const SERVER_VERSION = '0.1.0'
+const SERVER_VERSION = '1.0.0'
 
 const OFFLINE_TOOLS = new Set(['map_overview', 'read_node', 'find_nodes', 'validate_library', 'read_knowledge', 'list_knowledge', 'scan_repo_entrypoints'])
 

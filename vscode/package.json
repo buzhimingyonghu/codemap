@@ -2,7 +2,7 @@
   "name": "codemap",
   "displayName": "CodeMap",
   "description": "%codemap.description%",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "publisher": "codemap",
   "license": "MIT",
   "repository": {
@@ -238,7 +238,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.extension.json --noEmit && tsc -p tsconfig.webview.json --noEmit",
     "build": "node scripts/build.mjs",
     "test": "vitest run",
-    "package": "npm run build && vsce package --no-dependencies --allow-missing-repository -o codemap-0.1.0.vsix"
+    "package": "npm run build && vsce package --no-dependencies --allow-missing-repository -o codemap-1.0.0.vsix"
   },
   "dependencies": {
     "js-yaml": "^4.3.2",
