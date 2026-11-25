@@ -12,6 +12,7 @@ import {
   type CodemapData,
   type CodemapModel,
   type EdgeData,
+  type Issue,
   type LibraryCheck,
   type NodeEntry,
   type RequirementCheck
@@ -655,4 +656,38 @@ export function collectTodos(check: LibraryCheck, notes: { file: string; dir: st
     }
   }
   return { items, byNode, counts }
+}
+
+/** A map and everything inside it: node ids, and the YAML files (and their folders) they live in. */
+export function subtreeOf(c: MapContext, X: string): { ids: Set<string>; files: Set<string>; dirs: Set<string> } {
+  const models = [c.check.model, currentRequirement(c)?.model].filter(Boolean) as CodemapModel[]
+  const ids = new Set<string>([X])
+  const queue = [X]
+  while (queue.length) {
+    const id = queue.shift()!
+    for (const m of models)
+      for (const member of m.members.get(id) ?? []) {
+        if (ids.has(member)) continue
+        ids.add(member)
+        queue.push(member)
+      }
+  }
+  const files = new Set<string>()
+  for (const id of ids)
+    for (const m of models) {
+      const file = m.nodes.get(id)?.file
+      if (file) files.add(file)
+    }
+  return { ids, files, dirs: new Set([...files].map(dirOf)) }
+}
+
+/** The issues that point into the map: their location names one of its files or nodes. */
+export function issuesIn(issues: Issue[], scope: ReturnType<typeof subtreeOf>): Issue[] {
+  return issues.filter((issue) => issue.where.split(' ').some((word) => scope.files.has(word) || scope.ids.has(word)))
+}
+
+/** The to-dos of the map: on its nodes, or notes (with no node yet) in or below its folders. */
+export function todosIn(todos: Todos, scope: ReturnType<typeof subtreeOf>): TodoItem[] {
+  const dirs = [...scope.dirs].filter(Boolean)
+  return todos.items.filter((it) => (it.node ? scope.ids.has(it.node) : dirs.some((d) => it.dir === d || it.dir.startsWith(`${d}/`))))
 }

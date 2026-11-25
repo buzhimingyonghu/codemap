@@ -54,6 +54,7 @@ import {
   fieldRefs,
   filledFields,
   isMap,
+  issuesIn,
   mapGroups,
   missingRef,
   nodeName,
@@ -61,6 +62,8 @@ import {
   refiningFlow,
   stepsOf,
   structCard,
+  subtreeOf,
+  todosIn,
   type BallKind,
   type FlowStep,
   type MapContext,
@@ -363,7 +366,11 @@ function CodeMapStage({ data, frozen }: { data: CodeMapData; frozen: boolean }) 
     [view?.X, data.check, data.reqIndex, layoutSig, size.width > 0, ...(view?.node(view.X)?.layout ? [] : [Math.round(size.width / 200), Math.round(size.height / 200)])] // eslint-disable-line react-hooks/exhaustive-deps
   )
   const counts = useMemo(() => changedCounts(ctx), [data.version]) // eslint-disable-line react-hooks/exhaustive-deps
-  const issues = useMemo(() => allIssues(data), [data.check, data.yamlErrors]) // eslint-disable-line react-hooks/exhaustive-deps
+  const issues = useMemo(() => {
+    const all = allIssues(data)
+    return top && data.check ? issuesIn(all, subtreeOf(ctx, top)) : all
+  }, [data.check, data.yamlErrors, data.version, top]) // eslint-disable-line react-hooks/exhaustive-deps
+  const todos = useMemo(() => (top && data.check ? todosIn(data.todos, subtreeOf(ctx, top)) : data.todos.items), [data.todos, data.version, top]) // eslint-disable-line react-hooks/exhaustive-deps
 
   // The engine lives as long as the stage.
   const hostRef = useRef<EngineHost | null>(null)
@@ -736,6 +743,7 @@ function CodeMapStage({ data, frozen }: { data: CodeMapData; frozen: boolean }) 
     flowId,
     detail,
     issues,
+    todos,
     selField,
     onSelectField: (key) => {
       stop()
@@ -860,7 +868,7 @@ function CodeMapStage({ data, frozen }: { data: CodeMapData; frozen: boolean }) 
             {errors ? <CircleAlert size={12} /> : warnings ? <TriangleAlert size={12} /> : <CircleCheck size={12} />}
             {errors ? t('{n} errors', { n: errors }) + (warnings ? ` · ${t('{n} warnings', { n: warnings })}` : '') : warnings ? t('{n} warnings', { n: warnings }) : t('Checks passed')}
           </button>
-          {data.todos.items.length ? (
+          {todos.length ? (
             <button
               type="button"
               className="cm-chip is-todo"
@@ -871,7 +879,7 @@ function CodeMapStage({ data, frozen }: { data: CodeMapData; frozen: boolean }) 
               }}
             >
               <ListTodo size={12} />
-              {t('{n} to-dos', { n: data.todos.items.length })}
+              {t('{n} to-dos', { n: todos.length })}
             </button>
           ) : null}
           <IconButton size="sm" label={t('Reload Node Library')} onClick={() => void reloadCodeMap()}>
@@ -993,30 +1001,25 @@ function layoutKey(view: MapView, id: string, written: Record<string, unknown> |
   return view.resolve(short) === id ? short : id
 }
 
+/** Top-level maps only: deeper maps are reached through the map itself (enter / breadcrumbs). */
 function MapPicker({ data, current, onOpen }: { data: CodeMapData; current: string; onOpen: (id: string) => void }) {
   const check = data.check!
-  const { roots, others } = mapGroups(check)
+  const { roots } = mapGroups(check)
   const label = (id: string) => `${check.model.nodes.get(id)?.node.name ?? id} (${id})`
   return (
     <label className="cm-picker" data-tooltip={t('Open Map')}>
       <Layers size={14} />
       <select className="cm-select" value={current} onChange={(event) => onOpen(event.target.value)} aria-label={t('Open Map')}>
-        <optgroup label={t('Top level')}>
-          {roots.map((id) => (
-            <option key={id} value={id}>
-              {label(id)}
-            </option>
-          ))}
-        </optgroup>
-        {others.length ? (
-          <optgroup label={t('All maps')}>
-            {others.map((id) => (
-              <option key={id} value={id}>
-                {label(id)}
-              </option>
-            ))}
-          </optgroup>
-        ) : null}
+        {roots.includes(current) ? null : (
+          <option value={current} hidden>
+            {label(current)}
+          </option>
+        )}
+        {roots.map((id) => (
+          <option key={id} value={id}>
+            {label(id)}
+          </option>
+        ))}
       </select>
     </label>
   )
@@ -1032,6 +1035,8 @@ interface PanelProps {
   flowId: string | null
   detail: Detail
   issues: Issue[]
+  /** To-dos of the open map and everything inside it. */
+  todos: TodoItem[]
   selField: string | null
   onSelectField(key: string): void
   onDetail(detail: Detail): void
@@ -1115,7 +1120,7 @@ function DetailPanel(props: PanelProps) {
         </section>
       )}
           {struct ? <StructCard struct={struct} filled={filled} selField={selField} onSelectField={onSelectField} /> : null}
-      {mapKb.length ? (
+      {mapKb.length && (!detail || detail.kind === 'map') ? (
         <section className="cm-section">
           <h3>
             {t('Knowledge')} <span>{mapKb.length}</span>
@@ -2625,21 +2630,21 @@ function TodoList({ view, id, data, onDetail }: { view: MapView; id: string; dat
   )
 }
 
-/** Every to-do of the library, by component (folders with no node yet included). */
-function TodosDetail({ view, data, onDetail }: PanelProps) {
+/** The to-dos of the open map and everything inside it, by component (folders with no node yet included). */
+function TodosDetail({ view, data, todos, onDetail }: PanelProps) {
   const groups = useMemo(() => {
     const map = new Map<string, TodoItem[]>()
-    for (const it of data.todos.items) {
+    for (const it of todos) {
       const key = it.node ?? `dir:${it.dir}`
       map.set(key, [...(map.get(key) ?? []), it])
     }
     return [...map.entries()].sort(([a], [b]) => Number(a.startsWith('dir:')) - Number(b.startsWith('dir:')) || a.localeCompare(b))
-  }, [data.todos])
+  }, [todos])
   const nodeName = (id: string) => data.check?.model.nodes.get(id)?.node.name ?? id
   return (
     <>
       <div className="cm-title">
-        {t('To-dos')} <span className="cm-tab-count">{data.todos.items.length}</span>
+        {t('To-dos')} <span className="cm-tab-count">{todos.length}</span>
       </div>
       {groups.length ? (
         groups.map(([key, list]) => (
