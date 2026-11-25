@@ -599,7 +599,7 @@ export class CodeMapEngine {
     this.refreshEdges(null)
   }
 
-  /** The nodes that move together with `id`: its whole loop, or just itself. */
+  /** The nodes that move together when `id`'s loop frame is dragged: its whole loop, or just itself. */
   private groupOf(id: string): string[] {
     return this.scene?.view.loops.find((l) => l.nodes.includes(id))?.nodes ?? [id]
   }
@@ -911,15 +911,15 @@ export class CodeMapEngine {
         event.preventDefault()
         return
       }
-      // Node (or a loop frame): while editing, drag to move it; nodes in a loop move together.
-      // A click without movement only selects.
+      // Node (or a loop frame): while editing, drag to move it. A node moves alone (its loop frame
+      // follows its bounds); dragging the frame moves the whole loop. A click without movement only selects.
       const node = target.closest<SVGGElement>('.cm-node')
       const frameEl = target.closest<SVGGElement>('.cm-loop-frame')
       const id = node?.dataset.id ?? (frameEl ? this.scene?.view.loops.find((l) => l.id === frameEl.dataset.loop)?.nodes[0] : undefined)
       const box = id ? this.scene?.layout.pos.get(id) : null
       if (id && box && this.editing && !this.transitioning) {
         const w = this.toWorld(p)
-        const group = this.groupOf(id)
+        const group = node ? [id] : this.groupOf(id)
         const start = new Map(group.map((g) => [g, [this.scene!.layout.pos.get(g)!.x, this.scene!.layout.pos.get(g)!.y] as [number, number]]))
         this.nodeDrag = { id, group, dx: w.x - box.x, dy: w.y - box.y, sx: p.x, sy: p.y, ox: box.x, oy: box.y, start, moved: false }
         this.drag = null
